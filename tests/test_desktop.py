@@ -326,6 +326,26 @@ def test_v621_uses_native_tauri_notifications_and_records_patch() -> None:
     rust = Path("frontend/src-tauri/src/lib.rs").read_text(encoding="utf-8")
     notifications = Path("frontend/src/useAttentionNotifications.ts").read_text(encoding="utf-8")
 
+    project_metadata = cast("dict[str, str]", project["project"])
+    expected_frontend_version = project_metadata["version"].replace(".dev", "-dev.")
+    assert package["version"] == expected_frontend_version
+    assert tauri_config["version"] == expected_frontend_version
+    assert (
+        cast("dict[str, str]", package["dependencies"])["@tauri-apps/plugin-notification"]
+        == "2.3.3"
+    )
+    assert 'tauri-plugin-notification = "2.3.3"' in cargo
+    assert ".plugin(tauri_plugin_notification::init())" in rust
+    for permission in (
+        "notification:allow-is-permission-granted",
+        "notification:allow-request-permission",
+        "notification:allow-notify",
+    ):
+        assert permission in capabilities
+    assert "@tauri-apps/plugin-notification" in notifications
+    assert "isDesktopRuntime" in notifications
+    assert "sendNotification" in notifications
+    assert "Notification.requestPermission()" in notifications
 
 def test_v637_notification_activation_preserves_a_valid_internal_target() -> None:
     cargo = Path("frontend/src-tauri/Cargo.toml").read_text(encoding="utf-8")

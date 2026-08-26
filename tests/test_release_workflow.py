@@ -114,7 +114,7 @@ def test_windows_release_workflow_limits_permissions_and_validates_the_tag() -> 
     assert "scripts/check-release.ps1" in workflow
     assert "signing-targets.txt" in workflow
     assert "signing-evidence.json" in workflow
-    assert 'Copy-Item -LiteralPath $env:CODEX_SIGNING_LOG' not in workflow
+    assert "Copy-Item -LiteralPath $env:CODEX_SIGNING_LOG" not in workflow
     assert "Raw signing target paths must not be published." in workflow
     assert "Updater metadata installer name does not match the packaged installer." in workflow
     assert "Installer and updater signature must be included in the release asset set." in workflow
