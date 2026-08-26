@@ -1,0 +1,13 @@
+{"timestamp":"2026-07-04T04:00:00.000Z","type":"session_meta","payload":{"session_id":"session-modern","cwd":"D:\\Projects\\demo"}}
+{"timestamp":"2026-07-04T04:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-modern","started_at":1783137601}}
+{"timestamp":"2026-07-04T04:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"Inspect modern events."}}
+{"timestamp":"2026-07-04T04:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect modern events."}]}}
+{"timestamp":"2026-07-04T04:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"[external_agent_tool_call: mcp__demo__read]\ninput: {\"path\":\"README.md\"}\n[/external_agent_tool_call]"}}
+{"timestamp":"2026-07-04T04:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"mcp__demo__read","arguments":"{\"path\":\"README.md\"}","call_id":"call-modern"}}
+{"timestamp":"2026-07-04T04:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-modern","output":"{\"ok\":true}"}}
+{"timestamp":"2026-07-04T04:00:04.000Z","type":"event_msg","payload":{"type":"agent_message","message":"[external_agent_tool_result]\n{\"ok\":true}\n[/external_agent_tool_result]"}}
+{"timestamp":"2026-07-04T04:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Modern inspection stopped."}]}}
+{"timestamp":"2026-07-04T04:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Modern inspection stopped."}}
+{"timestamp":"2026-07-04T04:00:06.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-modern","reason":"interrupted"}}
+{"timestamp":"2026-07-04T04:00:07.000Z","type":"future_event","payload":{}}
+{"timestamp":"2026-07-04T04:00:08.000Z","type":"event_msg","payload":

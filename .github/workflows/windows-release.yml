@@ -1,0 +1,456 @@
+name: Windows release
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-verify:
+    if: github.event_name != 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@4959332f0f014c5280e7eac8b70c90cb574c9f9b
+        with:
+          version: "0.6.14"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Cache Rust and Tauri build data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            frontend/src-tauri/target/
+          key: ${{ runner.os }}-tauri-${{ hashFiles('frontend/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-tauri-
+      - name: Install build dependencies
+        run: uv sync --dev --python 3.12
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build sidecar before bundle
+        run: pwsh -NoProfile -File scripts/build-sidecar.ps1
+      - name: Disable updater artifacts for unsigned validation
+        shell: pwsh
+        run: |
+          @{ bundle = @{ createUpdaterArtifacts = $false } } |
+            ConvertTo-Json | Set-Content -LiteralPath "$env:RUNNER_TEMP/tauri.unsigned.conf.json" -Encoding utf8
+      - name: Build unsigned NSIS validation package
+        working-directory: frontend
+        run: npm exec tauri build -- --config src-tauri/tauri.release.conf.json --config "$env:RUNNER_TEMP/tauri.unsigned.conf.json" --bundles nsis
+      - name: Verify packaged sidecar
+        run: pwsh -NoProfile -File scripts/build-sidecar.ps1 -VerifyOnly
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-windows-nsis
+          path: frontend/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    environment: windows-production-signing
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      WINDOWS_SIGNING_PROVIDER: ${{ secrets.WINDOWS_SIGNING_PROVIDER }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+      TAURI_UPDATER_ENDPOINT: ${{ secrets.TAURI_UPDATER_ENDPOINT }}
+      WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+      AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+      AZURE_ARTIFACT_SIGNING_PROFILE: ${{ secrets.AZURE_ARTIFACT_SIGNING_PROFILE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@4959332f0f014c5280e7eac8b70c90cb574c9f9b
+        with:
+          version: "0.6.14"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Cache Rust and Tauri build data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            frontend/src-tauri/target/
+          key: ${{ runner.os }}-tauri-${{ hashFiles('frontend/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-tauri-
+      - name: Fail closed when release credentials are missing
+        shell: pwsh
+        run: |
+          $required = @(
+            "WINDOWS_SIGNING_PROVIDER",
+            "TAURI_SIGNING_PRIVATE_KEY",
+            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+            "TAURI_UPDATER_PUBLIC_KEY",
+            "TAURI_UPDATER_ENDPOINT",
+            "WINDOWS_EXPECTED_PUBLISHER"
+          )
+          if ($env:WINDOWS_SIGNING_PROVIDER -eq "azure") {
+            $required += @(
+              "AZURE_CLIENT_ID",
+              "AZURE_TENANT_ID",
+              "AZURE_SUBSCRIPTION_ID",
+              "AZURE_ARTIFACT_SIGNING_ENDPOINT",
+              "AZURE_ARTIFACT_SIGNING_ACCOUNT",
+              "AZURE_ARTIFACT_SIGNING_PROFILE"
+            )
+          } elseif ($env:WINDOWS_SIGNING_PROVIDER -eq "pfx" -or $env:WINDOWS_SIGNING_PROVIDER -eq "selfsigned") {
+            $required += @("WINDOWS_CERTIFICATE", "WINDOWS_CERTIFICATE_PASSWORD")
+          } else {
+            throw "WINDOWS_SIGNING_PROVIDER must be azure, pfx, or selfsigned."
+          }
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing required release credential: $name"
+            }
+          }
+      - name: Prepare Windows PFX signing certificate
+        if: env.WINDOWS_SIGNING_PROVIDER == 'pfx' || env.WINDOWS_SIGNING_PROVIDER == 'selfsigned'
+        shell: pwsh
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          "WINDOWS_CERTIFICATE_PATH=$certificatePath" | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Verify tag source
+        shell: pwsh
+        run: |
+          git fetch --no-tags origin refs/heads/master
+          $tagCommit = git rev-parse HEAD
+          $masterCommit = git rev-parse FETCH_HEAD
+          if ($tagCommit -ne $masterCommit) {
+            throw "Tag must point to the latest origin/master commit. Tag=$tagCommit master=$masterCommit"
+          }
+      - name: Prepare formal release version overlay
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw "Release tag has an invalid format: $env:RELEASE_TAG"
+          }
+          $releaseVersion = $env:RELEASE_TAG.Substring(1)
+          pwsh -NoProfile -File scripts/prepare-release-version.ps1 -Version $releaseVersion
+      - name: Verify synchronized release version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:RELEASE_TAG.Substring(1)
+          $projectVersion = uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ($tagVersion -ne $projectVersion) {
+            throw "Tag version $tagVersion does not match project version $projectVersion."
+          }
+      - name: Validate previous stable release assets
+        shell: pwsh
+        run: |
+          $previousStableTag = ""
+          $candidates = gh release list --limit 20 --json tagName,isDraft,isPrerelease | ConvertFrom-Json
+          foreach ($candidate in $candidates) {
+            if ($candidate.isDraft -or $candidate.isPrerelease) { continue }
+            $assetNames = @((gh release view $candidate.tagName --json assets | ConvertFrom-Json).assets.name)
+            $hasInstaller = @($assetNames | Where-Object { $_ -like "*setup.exe" }).Count -gt 0
+            $hasMetadata = @("latest.json", "checksums.sha256", "release-manifest.json") |
+              Where-Object { $_ -notin $assetNames } |
+              Measure-Object |
+              Select-Object -ExpandProperty Count
+            if ($hasInstaller -and $hasMetadata -eq 0) {
+              $previousStableTag = $candidate.tagName
+              break
+            }
+          }
+          if ($previousStableTag) {
+            $previousRoot = Join-Path $env:RUNNER_TEMP "previous-stable"
+            New-Item -ItemType Directory -Force -Path $previousRoot | Out-Null
+            gh release download $previousStableTag --dir $previousRoot `
+              --pattern "*setup.exe" `
+              --pattern "*.sig" `
+              --pattern "latest.json" `
+              --pattern "checksums.sha256" `
+              --pattern "release-manifest.json"
+            if ($LASTEXITCODE -ne 0) { throw "Previous stable assets could not be downloaded." }
+            $previousInstaller = Get-ChildItem $previousRoot -Filter "*setup.exe" -File | Select-Object -First 1
+            $previousSignature = Get-AuthenticodeSignature -FilePath $previousInstaller.FullName
+            if ($previousSignature.Status -ne "Valid" -or
+                $previousSignature.SignerCertificate.Subject -ne $env:WINDOWS_EXPECTED_PUBLISHER -or
+                $null -eq $previousSignature.TimeStamperCertificate) {
+              throw "Previous stable installer trust verification failed."
+            }
+            $checksumEntries = @{}
+            foreach ($line in Get-Content -LiteralPath "$previousRoot/checksums.sha256") {
+              if ($line -match '^([A-Fa-f0-9]{64}) \*(.+)$') {
+                $checksumEntries[$Matches[2]] = $Matches[1].ToUpperInvariant()
+              }
+            }
+            $hashedAssets = Get-ChildItem $previousRoot -File |
+              Where-Object { $_.Name -notin @("checksums.sha256", "release-manifest.json") }
+            foreach ($asset in $hashedAssets) {
+              $actualHash = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash
+              if (-not $checksumEntries.ContainsKey($asset.Name) -or $checksumEntries[$asset.Name] -ne $actualHash) {
+                throw "Previous stable checksum verification failed for $($asset.Name)."
+              }
+            }
+            $previousLatest = Get-Content -LiteralPath "$previousRoot/latest.json" -Raw | ConvertFrom-Json
+            $windowsPlatform = $previousLatest.platforms.PSObject.Properties |
+              Where-Object { $_.Name -like "windows-*" } |
+              Select-Object -First 1
+            $previousSignaturePath = "$($previousInstaller.FullName).sig"
+            if ($null -eq $windowsPlatform -or -not (Test-Path -LiteralPath $previousSignaturePath)) {
+              throw "Previous stable updater metadata is incomplete."
+            }
+            $metadataInstallerName = [Uri]::UnescapeDataString(([Uri]$windowsPlatform.Value.url).Segments[-1])
+            $expectedUpdaterSignature = (Get-Content -LiteralPath $previousSignaturePath -Raw).Trim()
+            if ($previousLatest.version -ne $previousStableTag.TrimStart("v") -or
+                $metadataInstallerName -ne $previousInstaller.Name -or
+                $windowsPlatform.Value.signature.Trim() -ne $expectedUpdaterSignature) {
+              throw "Previous stable updater metadata verification failed."
+            }
+            $previousManifest = Get-Content -LiteralPath "$previousRoot/release-manifest.json" -Raw | ConvertFrom-Json
+            if ($previousManifest.current_stable_tag -ne $previousStableTag) {
+              throw "Previous stable release manifest tag does not match."
+            }
+          }
+          "PREVIOUS_STABLE_TAG=$previousStableTag" | Add-Content -LiteralPath $env:GITHUB_ENV
+          $recoveryUrl = if ($previousStableTag) { "https://github.com/${{ github.repository }}/releases/tag/$previousStableTag" } else { "" }
+          "CODEX_MONITOR_RECOVERY_URL=$recoveryUrl" | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Install build dependencies
+        run: uv sync --dev --python 3.12
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Run formal release gate
+        run: pwsh -NoProfile -File scripts/check-release.ps1
+      - name: Install official Azure Artifact Signing module
+        if: env.WINDOWS_SIGNING_PROVIDER == 'azure'
+        shell: pwsh
+        run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.8 -Force -Repository PSGallery -Scope CurrentUser
+      - name: Authenticate to Azure with GitHub OIDC
+        if: env.WINDOWS_SIGNING_PROVIDER == 'azure'
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Build sidecar before bundle
+        run: pwsh -NoProfile -File scripts/build-sidecar.ps1
+      - name: Create CI-only updater and signing configuration
+        shell: pwsh
+        run: |
+          "CODEX_SIGNING_LOG=$env:RUNNER_TEMP/signing-targets.txt" |
+            Add-Content -LiteralPath $env:GITHUB_ENV
+          $pwshPath = Join-Path $PSHOME "pwsh.exe"
+          if (-not (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
+            throw "PowerShell executable was not found at $pwshPath"
+          }
+          if ($env:WINDOWS_SIGNING_PROVIDER -eq "azure") {
+            $signScript = Join-Path "${{ github.workspace }}" "scripts/sign-artifact.ps1"
+          } else {
+            $signScript = Join-Path "${{ github.workspace }}" "scripts/sign-pfx.ps1"
+          }
+          # Tauri string signCommand splits on spaces; object form is required when
+          # pwsh lives under "Program Files" or script paths contain whitespace.
+          $signCommand = @{
+            cmd = $pwshPath
+            args = @(
+              "-NoProfile"
+              "-NonInteractive"
+              "-ExecutionPolicy"
+              "Bypass"
+              "-File"
+              $signScript
+              "%1"
+            )
+          }
+          @{
+            bundle = @{ windows = @{ signCommand = $signCommand } }
+            plugins = @{
+              updater = @{
+                endpoints = @($env:TAURI_UPDATER_ENDPOINT)
+                pubkey = $env:TAURI_UPDATER_PUBLIC_KEY
+              }
+            }
+          } | ConvertTo-Json -Depth 6 |
+            Set-Content -LiteralPath "$env:RUNNER_TEMP/tauri.ci.release.conf.json" -Encoding utf8
+          "TAURI_CI_RELEASE_CONFIG=$env:RUNNER_TEMP/tauri.ci.release.conf.json" |
+            Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Sign sidecar before updater artifacts
+        shell: pwsh
+        run: |
+          $sidecar = "frontend/src-tauri/binaries/codex-monitor-sidecar-x86_64-pc-windows-msvc/codex-monitor-sidecar-x86_64-pc-windows-msvc.exe"
+          if ($env:WINDOWS_SIGNING_PROVIDER -eq "azure") {
+            & scripts/sign-artifact.ps1 -FilePath $sidecar
+          } else {
+            & scripts/sign-pfx.ps1 -FilePath $sidecar
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed for sidecar." }
+      - name: Build signed updater and NSIS package
+        working-directory: frontend
+        run: npm exec tauri build -- --config src-tauri/tauri.release.conf.json --config "$env:TAURI_CI_RELEASE_CONFIG" --bundles nsis
+      - name: Verify Windows artifact signatures
+        shell: pwsh
+        run: |
+          # Tauri restores an unsigned copy of the main binary to target/release after
+          # packaging (see tauri-bundler bundle_project). Release ships the NSIS installer
+          # and sidecar, so Authenticode checks must target those durable signed artifacts.
+          $sidecar = Get-Item "frontend/src-tauri/binaries/codex-monitor-sidecar-x86_64-pc-windows-msvc/codex-monitor-sidecar-x86_64-pc-windows-msvc.exe"
+          $installer = Get-ChildItem "frontend/src-tauri/target/release/bundle/nsis" -Filter "*setup.exe" -File |
+            Select-Object -First 1
+          foreach ($artifact in @($sidecar, $installer)) {
+            if ($null -eq $artifact) { throw "Expected signed Windows release artifact is missing." }
+            $signature = Get-AuthenticodeSignature -FilePath $artifact.FullName
+            if ($env:WINDOWS_SIGNING_PROVIDER -eq "selfsigned") {
+              if ($signature.Status -notin @("Valid", "UnknownError")) {
+                throw "Authenticode verification failed for $($artifact.Name): $($signature.Status)."
+              }
+            } elseif ($signature.Status -ne "Valid") {
+              throw "Authenticode verification failed for $($artifact.Name)."
+            }
+            if ($null -eq $signature.SignerCertificate) {
+              throw "Signer certificate is missing for $($artifact.Name)."
+            }
+            if ($signature.SignerCertificate.Subject -ne $env:WINDOWS_EXPECTED_PUBLISHER) {
+              throw "Unexpected publisher for $($artifact.Name): $($signature.SignerCertificate.Subject)"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "Authenticode timestamp is missing for $($artifact.Name)."
+            }
+          }
+          if (Test-Path -LiteralPath $env:CODEX_SIGNING_LOG) {
+            $signedTargets = Get-Content -LiteralPath $env:CODEX_SIGNING_LOG |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+              Sort-Object -Unique
+            if ($signedTargets.Count -lt 4) {
+              throw "Expected at least four signed targets, found $($signedTargets.Count)."
+            }
+            $mainExecutableTarget = $signedTargets |
+              Where-Object { [IO.Path]::GetFileName($_) -eq "codex-session-monitor.exe" } |
+              Select-Object -First 1
+            if ($null -eq $mainExecutableTarget) {
+              throw "Signed main executable target evidence is missing from the signing log."
+            }
+            $sidecarTarget = $signedTargets |
+              Where-Object { [IO.Path]::GetFileName($_) -eq "codex-monitor-sidecar-x86_64-pc-windows-msvc.exe" } |
+              Select-Object -First 1
+            if ($null -eq $sidecarTarget) {
+              throw "Signed sidecar target evidence is missing from the signing log."
+            }
+            $installerTarget = $signedTargets |
+              Where-Object { [IO.Path]::GetFileName($_) -like "*setup.exe" } |
+              Select-Object -First 1
+            if ($null -eq $installerTarget) {
+              throw "Signed NSIS setup.exe target evidence is missing from the signing log."
+            }
+            # Tauri/NSIS signs the embedded uninstaller as a temp nst*.tmp, not uninstall.exe.
+            $uninstallerTarget = $signedTargets |
+              Where-Object {
+                $name = [IO.Path]::GetFileName($_)
+                $name -match '^nst.+\.tmp$' -or $name -eq "uninstall.exe"
+              } |
+              Select-Object -First 1
+            if ($null -eq $uninstallerTarget) {
+              throw "Signed NSIS uninstaller target evidence is missing (expected nst*.tmp or uninstall.exe)."
+            }
+            $signingEvidence = [ordered]@{
+              artifacts = @($signedTargets | ForEach-Object {
+                [ordered]@{
+                  name = [IO.Path]::GetFileName($_)
+                  signed = $true
+                }
+              })
+              publisher = $env:WINDOWS_EXPECTED_PUBLISHER
+            }
+            $signingEvidence | ConvertTo-Json -Depth 5 |
+              Set-Content -LiteralPath "frontend/src-tauri/target/release/bundle/nsis/signing-evidence.json" -Encoding utf8
+          } else {
+            throw "Signing target evidence is missing."
+          }
+      - name: Create checksum and release manifest
+        shell: pwsh
+        run: |
+          $bundleRoot = "frontend/src-tauri/target/release/bundle/nsis"
+          $updaterInstaller = Get-ChildItem $bundleRoot -Filter "*setup.exe" -File | Select-Object -First 1
+          if ($null -eq $updaterInstaller) { throw "Updater installer is missing." }
+          $signaturePath = "$($updaterInstaller.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Updater signature is missing." }
+          $signature = Get-Content -LiteralPath $signaturePath -Raw
+          [ordered]@{
+            version = $env:RELEASE_TAG.Substring(1)
+            notes = "See the GitHub release notes."
+            pub_date = (Get-Date).ToUniversalTime().ToString("o")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = $signature.Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/$env:RELEASE_TAG/$($updaterInstaller.Name)"
+              }
+            }
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bundleRoot/latest.json" -Encoding utf8
+          $releaseFiles = Get-ChildItem $bundleRoot -File |
+            Where-Object { $_.Name -notin @("checksums.sha256", "release-manifest.json") }
+          $assetNames = @($releaseFiles.Name)
+          if ($updaterInstaller.Name -notin $assetNames -or "$($updaterInstaller.Name).sig" -notin $assetNames) {
+            throw "Installer and updater signature must be included in the release asset set."
+          }
+          $artifactDetails = @($releaseFiles | ForEach-Object {
+            [ordered]@{
+              name = $_.Name
+              sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+            }
+          })
+          $releaseFiles | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0} *{1}" -f $_.Hash, (Split-Path -Leaf $_.Path) } |
+            Set-Content -LiteralPath "$bundleRoot/checksums.sha256" -Encoding utf8
+          [ordered]@{
+            version = $env:RELEASE_TAG.Substring(1)
+            current_stable_tag = $env:RELEASE_TAG
+            previous_stable_tag = $env:PREVIOUS_STABLE_TAG
+            commit = "${{ github.sha }}"
+            target = "windows-x86_64"
+            expected_publisher = $env:WINDOWS_EXPECTED_PUBLISHER
+            signature_status = "Authenticode verified; Tauri updater signature generated"
+            test_evidence = @("https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+            artifacts = $artifactDetails
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bundleRoot/release-manifest.json" -Encoding utf8
+          $latest = Get-Content -LiteralPath "$bundleRoot/latest.json" -Raw | ConvertFrom-Json
+          $metadataInstallerName = [Uri]::UnescapeDataString(([Uri]$latest.platforms.'windows-x86_64'.url).Segments[-1])
+          if ($metadataInstallerName -ne $updaterInstaller.Name) {
+            throw "Updater metadata installer name does not match the packaged installer."
+          }
+          if (@($releaseFiles.Name | Where-Object { $_ -eq "signing-targets.txt" }).Count -gt 0) {
+            throw "Raw signing target paths must not be published."
+          }
+      - name: Create draft release with current and previous release metadata
+        shell: pwsh
+        run: |
+          $uploadFiles = Get-ChildItem "frontend/src-tauri/target/release/bundle/nsis" -File |
+            Sort-Object -Property Name |
+            ForEach-Object { $_.FullName }
+          if ($uploadFiles.Count -eq 0) { throw "No release assets were produced." }
+          gh release create "$env:RELEASE_TAG" --draft --generate-notes @uploadFiles

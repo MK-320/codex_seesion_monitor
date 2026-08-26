@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-04T03:00:00.000Z","type":"session_meta","payload":{"session_id":"session-demo","id":"session-demo","cwd":"D:\\Projects\\demo","originator":"Codex Desktop","cli_version":"0.200.0","source":"vscode","model_provider":"openai","base_instructions":{"text":"omitted"}}}
+{"timestamp":"2026-07-04T03:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1783134001,"model_context_window":null}}
+{"timestamp":"2026-07-04T03:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"Inspect the parser."}}
+{"timestamp":"2026-07-04T03:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"[external_agent_tool_call: mcp__demo__read]\ninput: {\"path\":\"README.md\"}\n[/external_agent_tool_call]"}}
+{"timestamp":"2026-07-04T03:00:04.000Z","type":"event_msg","payload":{"type":"agent_message","message":"[external_agent_tool_result]\n{\"ok\":true}\n[/external_agent_tool_result]"}}
+{"timestamp":"2026-07-04T03:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Parser inspection complete."}}
+{"timestamp":"2026-07-04T03:00:06.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}
+{"timestamp":"2026-07-04T03:00:06.000Z","type":"response_item","payload":{"role":"assistant","content":[]}}
