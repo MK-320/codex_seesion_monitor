@@ -347,6 +347,7 @@ def test_v621_uses_native_tauri_notifications_and_records_patch() -> None:
     assert "sendNotification" in notifications
     assert "Notification.requestPermission()" in notifications
 
+
 def test_v637_notification_activation_preserves_a_valid_internal_target() -> None:
     cargo = Path("frontend/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     rust = Path("frontend/src-tauri/src/lib.rs").read_text(encoding="utf-8")
