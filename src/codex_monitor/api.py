@@ -320,7 +320,7 @@ def create_app(  # noqa: C901, PLR0915
         nonlocal activity_alert_seconds
         ensure_same_origin(request)
         if config.config_file is None:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
         await run_sync(
             save_saved_activity_alert_seconds,
             config.config_file,
@@ -337,7 +337,7 @@ def create_app(  # noqa: C901, PLR0915
         nonlocal saved_layout
         ensure_same_origin(request)
         if config.config_file is None:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
         await run_sync(save_saved_layout, config.config_file, payload)
         saved_layout = payload
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -410,11 +410,11 @@ def create_app(  # noqa: C901, PLR0915
         try:
             project, added = await monitor.add_project(Path(payload.project_root))
         except ValueError as error:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
         response.status_code = status.HTTP_201_CREATED if added else status.HTTP_200_OK
         if payload.persist:
             if config.config_file is None:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
             saved_roots.add(project.root.resolve())
             await run_sync(
                 save_saved_project_roots,
@@ -441,10 +441,10 @@ def create_app(  # noqa: C901, PLR0915
             tuple(Path(root) for root in payload.project_roots)
         )
         if not results and errors:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, errors[0][1])
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, errors[0][1])
         if payload.persist:
             if config.config_file is None:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
             saved_roots.update(project.root.resolve() for project, _ in results)
             await run_sync(
                 save_saved_project_roots,
@@ -481,7 +481,7 @@ def create_app(  # noqa: C901, PLR0915
         try:
             project, added = await monitor.add_project(selected)
         except ValueError as error:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
         if config.config_file is not None:
             saved_roots.add(project.root.resolve())
             await run_sync(
@@ -534,7 +534,7 @@ def create_app(  # noqa: C901, PLR0915
     ) -> SessionDetail:
         if before is not None and anchor_turn_id is not None:
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "before and anchor_turn_id are mutually exclusive",
             )
         detail = session_store.detail(
