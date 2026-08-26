@@ -18,7 +18,7 @@ uv sync --dev
 uv run codex-monitor --project D:\path\to\project-a --project D:\path\to\project-b --port 8000
 ```
 
-然后打开 `http://127.0.0.1:8000`。`--project` 可以重复传入多个项目；默认读取当前用户的 Codex 会话目录。测试或演示时可使用 `--session-root` 指向脱敏数据目录，并可使用 `--no-saved-projects` 忽略已保存项目。
+然后打开 `http://127.0.0.1:8000`。`--project` 可以重复传入多个项目；默认读取当前用户的 Codex 会话目录。也可在界面中使用“导入项目”添加项目，已保存项目会在重启后恢复；移除项目仅从监控清单中移除，不删除项目目录或 Codex 会话文件。测试或演示时可使用 `--session-root` 指向脱敏数据目录，并可使用 `--no-saved-projects` 忽略已保存项目。
 
 ### Windows 浏览器开发
 
