@@ -53,7 +53,7 @@ if ([string]::IsNullOrWhiteSpace($signtool)) {
 $resolvedFile = Resolve-Path -LiteralPath $FilePath
 & $signtool sign `
     /fd SHA256 `
-    /tr https://timestamp.digicert.com `
+    /tr http://timestamp.digicert.com `
     /td SHA256 `
     /f $env:WINDOWS_CERTIFICATE_PATH `
     /p $env:WINDOWS_CERTIFICATE_PASSWORD `
