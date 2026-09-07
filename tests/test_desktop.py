@@ -53,11 +53,13 @@ def test_desktop_scripts_reuse_react_and_delegate_sidecar_to_tauri() -> None:
     scripts = cast("dict[str, str]", package["scripts"])
     dev_script = Path("scripts/start-desktop-dev.ps1").read_text(encoding="utf-8")
     tauri_script = Path("scripts/start-tauri-dev.ps1").read_text(encoding="utf-8")
+    desktop_build_script = Path("scripts/build-desktop.ps1").read_text(encoding="utf-8")
     desktop_vite = Path("frontend/vite.desktop.config.ts").read_text(encoding="utf-8")
     build_script = Path("frontend/src-tauri/build.rs").read_text(encoding="utf-8")
 
     assert "start-tauri-dev.ps1" in scripts["desktop:dev"]
     assert scripts["build:desktop"] == "vite build --config vite.desktop.config.ts"
+    assert scripts["build:static"] == "vite build --config vite.config.ts"
     assert scripts["dev:desktop"] == "vite --config vite.desktop.config.ts"
     assert "build-sidecar.ps1" in dev_script
     assert "python -m codex_monitor" not in dev_script
@@ -68,6 +70,10 @@ def test_desktop_scripts_reuse_react_and_delegate_sidecar_to_tauri() -> None:
     assert '$targetRoot = Join-Path $repoRoot ".cargo-target"' in dev_script
     assert '$env:CARGO_TARGET_DIR = Join-Path $repoRoot ".cargo-target"' in tauri_script
     assert "npm.cmd exec tauri dev" in tauri_script
+    assert "build:static" in desktop_build_script
+    assert "build-sidecar.ps1" in desktop_build_script
+    assert "sidecarStaticRoot" in desktop_build_script
+    assert "codex_monitor\\static" in desktop_build_script
     assert '"run", "dev:desktop"' in tauri_script
     assert "127.0.0.1:1420" in tauri_script
     assert 'GetEnvironmentVariables("Process")' in tauri_script
@@ -237,6 +243,11 @@ def test_v630_release_overlay_builds_a_safe_windows_nsis_package() -> None:
     uninstall_hooks = Path("frontend/src-tauri/windows/hooks.nsh").read_text(encoding="utf-8")
     assert "NSIS_HOOK_PREINSTALL" in uninstall_hooks
     assert "NSIS_HOOK_PREUNINSTALL" in uninstall_hooks
+    assert 'taskkill.exe" /F /T /IM "Codex Session Monitor.exe"' in uninstall_hooks
+    assert (
+        'taskkill.exe" /F /T /IM "codex-monitor-sidecar-x86_64-pc-windows-msvc.exe"'
+        in uninstall_hooks
+    )
     assert "${IfNot} ${Silent}" in uninstall_hooks
     assert '"/UPDATE"' in uninstall_hooks
     assert "$LOCALAPPDATA\\CodexSessionMonitor\\config.json" in uninstall_hooks

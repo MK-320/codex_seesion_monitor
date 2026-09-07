@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -12,8 +13,9 @@ from codex_monitor.api import create_app
 from codex_monitor.config import AppConfig, load_saved_project_roots, save_saved_project_roots
 from codex_monitor.models import SessionId, SessionMetadata, SessionStatus, Turn, TurnId
 from codex_monitor.parser import parse_file
-from codex_monitor.schemas import SessionChangedEvent, SnapshotEvent
+from codex_monitor.schemas import SessionChangedEvent, SnapshotEvent, TraceRevisionEvent
 from codex_monitor.store import SessionStore
+from codex_monitor.trace_store import TraceStore
 
 FIXTURE = Path(__file__).parent / "fixtures" / "desktop_session.jsonl"
 MODERN_FIXTURE = Path(__file__).parent / "fixtures" / "modern_session.jsonl"
@@ -268,6 +270,256 @@ def test_api_exposes_structured_attention_and_parse_diagnostics(tmp_path: Path) 
         "malformed_line_count": 1,
         "oversized_line_count": 0,
     }
+
+
+def test_api_exposes_paginated_lossless_traces_and_search_modes(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    store = SessionStore()
+    _ = anyio.run(store.put, session)
+    app = create_app(AppConfig(project_root=tmp_path, session_root=session_root), store)
+
+    with TestClient(app) as client:
+        page = client.get(
+            "/api/sessions/default:session-modern/traces",
+            params={"limit": 2},
+        )
+        full_match = client.get(
+            "/api/sessions/default:session-modern/traces",
+            params={"query": "README.md"},
+        )
+        metadata_match = client.get(
+            "/api/sessions/default:session-modern/traces",
+            params={"query": "README.md", "metadata_only": "true"},
+        )
+
+    assert page.status_code == 200
+    page_data = cast("dict[str, object]", page.json())
+    assert page_data["total"] == 13
+    assert len(cast("list[object]", page_data["events"])) == 2
+    assert page_data["has_earlier"] is True
+    assert full_match.json()["total"] == 2
+    assert metadata_match.json()["total"] == 0
+
+
+def test_api_manages_trace_storage_and_exports_raw_event(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    store = SessionStore()
+    _ = anyio.run(store.put, session)
+    app = create_app(
+        AppConfig(project_root=tmp_path, session_root=session_root, trace_root=tmp_path / "traces"),
+        store,
+    )
+    with TestClient(app) as client:
+        status_response = client.get("/api/traces/status")
+        event = next(item for item in session.trace_events if item.event_kind == "function_call")
+        raw = client.get(f"/api/sessions/{session.session_key}/traces/{event.trace_id}")
+        content = client.get(
+            f"/api/sessions/{session.session_key}/traces/{event.trace_id}/content",
+            params={"content": "raw", "offset": 0, "length": 32},
+        )
+        exported = client.get(f"/api/sessions/{session.session_key}/traces/export")
+        updated = client.put(
+            "/api/traces/settings",
+            json={"enabled": True, "retention_days": 30},
+        )
+        cleared = client.post("/api/traces/clear")
+    assert status_response.status_code == 200
+    assert status_response.json()["file_count"] == 1
+    assert raw.status_code == 200
+    assert raw.json()["trace_id"] == event.trace_id
+    assert raw.json()["input_value"] is None
+    assert content.status_code == 200
+    assert content.json()["has_more"] is True
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("application/json")
+    assert updated.status_code == 200
+    assert updated.json()["retention_days"] == 30
+    assert cleared.status_code == 200
+    assert cleared.json()["file_count"] == 0
+
+
+def test_api_reads_persisted_trace_events_when_session_is_not_loaded(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    trace_root = tmp_path / "traces"
+    TraceStore(trace_root).save_session(session)
+    store = SessionStore()
+    app = create_app(
+        AppConfig(project_root=tmp_path, session_root=session_root, trace_root=trace_root),
+        store,
+    )
+    event = next(item for item in session.trace_events if item.event_kind == "function_call")
+
+    with TestClient(app) as client:
+        page = client.get(
+            f"/api/sessions/{session.session_key}/traces",
+            params={"limit": 1},
+        )
+        raw = client.get(f"/api/sessions/{session.session_key}/traces/{event.trace_id}")
+        content = client.get(
+            f"/api/sessions/{session.session_key}/traces/{event.trace_id}/content",
+            params={"content": "raw", "offset": 0, "length": 64},
+        )
+        exported = client.get(f"/api/sessions/{session.session_key}/traces/export")
+
+    assert page.status_code == 200
+    assert page.json()["total"] == len(session.trace_events)
+    assert raw.status_code == 200
+    assert raw.json()["trace_id"] == event.trace_id
+    assert content.status_code == 200
+    assert content.json()["trace_id"] == event.trace_id
+    assert exported.status_code == 200
+    assert exported.json()["events"]
+
+
+def test_trace_store_persists_fts_index_and_searches_full_content(tmp_path: Path) -> None:
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    trace_store = TraceStore(tmp_path / "traces")
+    trace_store.save_session(session)
+
+    matches = trace_store.search_events(
+        session.session_key,
+        query="README.md",
+    )
+    metadata_matches = trace_store.search_events(
+        session.session_key,
+        query="README.md",
+        metadata_only=True,
+    )
+
+    assert matches
+    assert any("README.md" in str(event.input_value) for event in matches)
+    assert metadata_matches == []
+    assert (tmp_path / "traces" / "traces.sqlite3").is_file()
+
+
+def test_trace_store_clear_removes_index_without_touching_source(tmp_path: Path) -> None:
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    source = tmp_path / "source.jsonl"
+    _ = source.write_text("source", encoding="utf-8")
+    trace_store = TraceStore(tmp_path / "traces")
+    trace_store.save_session(session)
+
+    _ = trace_store.clear()
+
+    assert source.read_text(encoding="utf-8") == "source"
+    assert trace_store.search_events(session.session_key) == []
+
+
+def test_trace_api_keyset_cursor_rejects_changed_filters(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    store = SessionStore()
+    trace_store = TraceStore(tmp_path / "traces")
+    store.attach_trace_store(trace_store)
+    _ = anyio.run(store.put, session)
+    app = create_app(
+        AppConfig(project_root=tmp_path, session_root=session_root, trace_root=tmp_path / "traces"),
+        store,
+    )
+
+    with TestClient(app) as client:
+        first = client.get(
+            f"/api/sessions/{session.session_key}/traces",
+            params={"limit": 2},
+        )
+        first_data = cast("dict[str, object]", first.json())
+        cursor_value = first_data.get("next_cursor")
+        assert isinstance(cursor_value, str)
+        cursor = cursor_value
+        second = client.get(
+            f"/api/sessions/{session.session_key}/traces",
+            params={"limit": 2, "cursor": cursor},
+        )
+        changed = client.get(
+            f"/api/sessions/{session.session_key}/traces",
+            params={"limit": 2, "cursor": cursor, "event_kind": "function_call"},
+        )
+        conflicting = client.get(
+            f"/api/sessions/{session.session_key}/traces",
+            params={"limit": 2, "before": 1, "cursor": cursor},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["events"]
+    assert changed.status_code == 409
+    assert conflicting.status_code == 409
+
+
+def test_cross_session_trace_search_returns_metadata_only_results(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    store = SessionStore()
+    trace_store = TraceStore(tmp_path / "traces")
+    store.attach_trace_store(trace_store)
+    _ = anyio.run(store.put, session)
+    app = create_app(
+        AppConfig(project_root=tmp_path, session_root=session_root, trace_root=tmp_path / "traces"),
+        store,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/traces/search",
+            json={"query": "mcp__demo__read", "metadata_only": True, "limit": 10},
+        )
+        invalid_cursor = client.post(
+            "/api/traces/search",
+            json={"query": "mcp__demo__read", "metadata_only": True, "cursor": "invalid"},
+        )
+
+    assert response.status_code == 200
+    data = cast("dict[str, object]", response.json())
+    results = cast("list[dict[str, object]]", data["results"])
+    first_result = results[0]
+    first_event = cast("dict[str, object]", first_result["event"])
+    assert data["total"] == 1
+    assert first_result["session_key"] == session.session_key
+    assert first_event["input_value"] is None
+    assert invalid_cursor.status_code == 409
+
+
+def test_api_controls_trace_backfill_without_touching_source_logs(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    store = SessionStore()
+    store.attach_trace_store(TraceStore(tmp_path / "traces"))
+    app = create_app(AppConfig(project_root=tmp_path, session_root=session_root), store)
+
+    store.begin_trace_backfill(3)
+    with TestClient(app) as client:
+        paused = client.post("/api/traces/backfill/pause")
+        resumed = client.post("/api/traces/backfill/resume")
+        status = client.get("/api/traces/status")
+        rebuilt = client.post("/api/traces/rebuild")
+
+    assert paused.status_code == 200
+    assert paused.json()["backfill"] == {
+        "state": "paused",
+        "processed": 0,
+        "total": 3,
+        "error": None,
+    }
+    assert resumed.status_code == 200
+    assert resumed.json()["backfill_state"] in {"building", "complete"}
+    assert status.status_code == 200
+    assert status.json()["file_count"] == 0
+    assert rebuilt.status_code == 200
 
 
 def test_attention_context_matches_across_rest_and_websocket_v1(tmp_path: Path) -> None:
@@ -568,6 +820,31 @@ def test_websocket_sends_session_update_after_snapshot(tmp_path: Path) -> None:
     assert update.event == "session_updated"
     assert update.version == initial.version + 1
     assert update.session_key == "default:session-demo"
+
+
+def test_websocket_sends_trace_revision_without_trace_payload(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session = parse_file(MODERN_FIXTURE)
+    assert session is not None
+    store = SessionStore()
+    _ = anyio.run(store.put, session)
+    app = create_app(AppConfig(project_root=tmp_path, session_root=session_root), store)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
+        _ = SnapshotEvent.model_validate_json(websocket.receive_text())
+        session.trace_events.append(
+            replace(session.trace_events[-1], trace_id="new-trace", sequence=99)
+        )
+        assert client.portal is not None
+        _ = client.portal.call(store.put, session)
+        update = TraceRevisionEvent.model_validate_json(websocket.receive_text())
+
+    assert update.event == "trace_revision"
+    assert update.session_key == session.session_key
+    assert update.data.session_key == session.session_key
+    assert update.added_trace_ids
+    assert update.updated_trace_ids == ()
 
 
 def test_websocket_update_uses_project_scoped_key(tmp_path: Path) -> None:

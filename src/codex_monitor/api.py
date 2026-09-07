@@ -1,11 +1,13 @@
+import hashlib
 import hmac
 import json
 import time
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, override
+from typing import TYPE_CHECKING, Annotated, Literal, cast, override
 
 import anyio
 from anyio.to_thread import run_sync
@@ -19,7 +21,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, SecretStr
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -28,14 +30,17 @@ from starlette.types import ASGIApp
 
 from codex_monitor import __version__
 from codex_monitor.config import (
+    DEFAULT_TRACE_ROOT,
     AppConfig,
     LayoutPreferences,
     load_saved_activity_alert_seconds,
     load_saved_layout,
     load_saved_project_roots,
+    load_saved_trace_settings,
     save_saved_activity_alert_seconds,
     save_saved_layout,
     save_saved_project_roots,
+    save_saved_trace_settings,
 )
 from codex_monitor.diagnostic_events import (
     DiagnosticEmitter,
@@ -44,10 +49,29 @@ from codex_monitor.diagnostic_events import (
 )
 from codex_monitor.diagnostics import build_diagnostics
 from codex_monitor.monitor import Monitor
-from codex_monitor.schemas import SessionDetail, SessionSummary
+from codex_monitor.schemas import (
+    SessionDetail,
+    SessionSummary,
+    TracePage,
+    TraceSearchPage,
+    TraceSearchRequest,
+    TraceSearchResult,
+    trace_page,
+    trace_page_events,
+)
 from codex_monitor.store import SessionStore
+from codex_monitor.trace_store import TraceStore
+
+if TYPE_CHECKING:
+    from codex_monitor.models import TraceEvent
 
 STATIC_DIR = Path(__file__).with_name("static")
+
+
+class _SearchCursorError(ValueError):
+    pass
+
+
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self'; "
@@ -210,6 +234,23 @@ def create_app(  # noqa: C901, PLR0915
     diagnostic_emitter: DiagnosticEmitter | None = None,
 ) -> FastAPI:
     session_store = SessionStore() if store is None else store
+    trace_enabled, trace_retention_days = (
+        (config.trace_enabled, config.trace_retention_days)
+        if config.config_file is None
+        else load_saved_trace_settings(
+            config.config_file,
+            config.trace_enabled,
+            config.trace_retention_days,
+        )
+    )
+    trace_store: TraceStore | None = None
+    if config.config_file is not None or config.trace_root != DEFAULT_TRACE_ROOT:
+        trace_store = TraceStore(
+            config.trace_root,
+            enabled=trace_enabled,
+            retention_days=trace_retention_days,
+        )
+        session_store.attach_trace_store(trace_store)
     monitor = Monitor(config, session_store, diagnostic_emitter)
     started_at = time.time()
     websocket_clients = 0
@@ -290,6 +331,7 @@ def create_app(  # noqa: C901, PLR0915
         active_roots = {project.root.resolve() for project in active_projects}
         return {
             "activity_alert_seconds": activity_alert_seconds,
+            "trace": session_store.trace_status(),
             "layout": None if saved_layout is None else saved_layout.model_dump(),
             "projects": [
                 {
@@ -320,7 +362,7 @@ def create_app(  # noqa: C901, PLR0915
         nonlocal activity_alert_seconds
         ensure_same_origin(request)
         if config.config_file is None:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
         await run_sync(
             save_saved_activity_alert_seconds,
             config.config_file,
@@ -337,7 +379,7 @@ def create_app(  # noqa: C901, PLR0915
         nonlocal saved_layout
         ensure_same_origin(request)
         if config.config_file is None:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
         await run_sync(save_saved_layout, config.config_file, payload)
         saved_layout = payload
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -410,11 +452,11 @@ def create_app(  # noqa: C901, PLR0915
         try:
             project, added = await monitor.add_project(Path(payload.project_root))
         except ValueError as error:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
         response.status_code = status.HTTP_201_CREATED if added else status.HTTP_200_OK
         if payload.persist:
             if config.config_file is None:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
             saved_roots.add(project.root.resolve())
             await run_sync(
                 save_saved_project_roots,
@@ -441,10 +483,10 @@ def create_app(  # noqa: C901, PLR0915
             tuple(Path(root) for root in payload.project_roots)
         )
         if not results and errors:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, errors[0][1])
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, errors[0][1])
         if payload.persist:
             if config.config_file is None:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Persistence disabled")
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Persistence disabled")
             saved_roots.update(project.root.resolve() for project, _ in results)
             await run_sync(
                 save_saved_project_roots,
@@ -481,7 +523,7 @@ def create_app(  # noqa: C901, PLR0915
         try:
             project, added = await monitor.add_project(selected)
         except ValueError as error:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
         if config.config_file is not None:
             saved_roots.add(project.root.resolve())
             await run_sync(
@@ -534,7 +576,7 @@ def create_app(  # noqa: C901, PLR0915
     ) -> SessionDetail:
         if before is not None and anchor_turn_id is not None:
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "before and anchor_turn_id are mutually exclusive",
             )
         detail = session_store.detail(
@@ -554,6 +596,291 @@ def create_app(  # noqa: C901, PLR0915
                 )
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
         return detail
+
+    async def get_session_traces(  # noqa: PLR0913
+        session_key: str,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        before: Annotated[int | None, Query(ge=0)] = None,
+        query: Annotated[str | None, Query(max_length=512)] = None,
+        metadata_only: bool = False,
+        event_kind: Annotated[str | None, Query(max_length=64)] = None,
+        trace_status: Annotated[str | None, Query(max_length=32)] = None,
+        tool_name: Annotated[str | None, Query(max_length=256)] = None,
+        from_time: Annotated[float | None, Query(ge=0)] = None,
+        to_time: Annotated[float | None, Query(ge=0)] = None,
+        turn_id: Annotated[str | None, Query(max_length=256)] = None,
+        cursor: Annotated[str | None, Query(max_length=1024)] = None,
+    ) -> TracePage:
+        session = session_store.get(session_key)
+        if session is None:
+            persisted = (
+                trace_store.read_trace_events(session_key) if trace_store is not None else []
+            )
+            if not persisted:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+            events = persisted
+            try:
+                return trace_page_events(
+                    events,
+                    limit,
+                    before,
+                    query,
+                    metadata_only,
+                    event_kind,
+                    trace_status,
+                    tool_name,
+                    from_time,
+                    to_time,
+                    turn_id,
+                    cursor,
+                )
+            except ValueError as error:
+                raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        try:
+            return trace_page(
+                session,
+                limit,
+                before,
+                query,
+                metadata_only,
+                event_kind,
+                trace_status,
+                tool_name,
+                from_time,
+                to_time,
+                turn_id,
+                cursor,
+            )
+        except ValueError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+
+    async def search_traces(payload: TraceSearchRequest) -> TraceSearchPage:
+        matches: list[tuple[str, TraceEvent]]
+        if trace_store is not None:
+            matches = trace_store.search_all_events(
+                query=payload.query,
+                metadata_only=payload.metadata_only,
+                provider=payload.provider,
+                turn_id=payload.turn_id,
+                event_kind=payload.event_kind,
+                status=payload.status,
+                tool_name=payload.tool_name,
+                from_time=payload.from_time,
+                to_time=payload.to_time,
+            )
+        else:
+            matches = []
+            for session in session_store.all_sessions():
+                if payload.session_key is not None and session.session_key != payload.session_key:
+                    continue
+                if payload.provider is not None and payload.provider != "codex":
+                    continue
+                page = trace_page_events(
+                    session.trace_events,
+                    limit=500,
+                    query=payload.query,
+                    metadata_only=payload.metadata_only,
+                    event_kind=payload.event_kind,
+                    status=payload.status,
+                    tool_name=payload.tool_name,
+                    from_time=payload.from_time,
+                    to_time=payload.to_time,
+                    turn_id=payload.turn_id,
+                )
+                selected_ids = {item.trace_id for item in page.events}
+                matches.extend(
+                    (session.session_key, event)
+                    for event in session.trace_events
+                    if event.trace_id in selected_ids
+                )
+        if payload.session_key is not None:
+            matches = [item for item in matches if item[0] == payload.session_key]
+        fingerprint_source = "|".join(
+            f"{session}:{event.sequence}:{event.trace_id}" for session, event in matches
+        )
+        fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+        start = _decode_search_cursor(payload.cursor, fingerprint) if payload.cursor else 0
+        if start < 0 or start > len(matches):
+            raise HTTPException(status.HTTP_409_CONFLICT, "cursor is invalid or expired")
+        selected = matches[start : start + payload.limit]
+        results = tuple(
+            TraceSearchResult(
+                session_key=session_key,
+                event=trace_page_events([event]).events[0],
+            )
+            for session_key, event in selected
+        )
+        next_cursor = (
+            None
+            if start + len(selected) >= len(matches)
+            else _encode_search_cursor(start + len(selected), fingerprint)
+        )
+        return TraceSearchPage(
+            results=results,
+            total=len(matches),
+            next_cursor=next_cursor,
+            metadata_only=payload.metadata_only,
+            query=payload.query,
+            index_state="ready" if trace_store is not None else "unavailable",
+        )
+
+    async def get_trace_status() -> dict[str, object]:
+        return session_store.trace_status()
+
+    class TraceSettings(BaseModel):
+        enabled: bool = True
+        retention_days: int | None = None
+
+    async def save_trace_settings(request: Request, payload: TraceSettings) -> dict[str, object]:
+        ensure_same_origin(request)
+        if payload.retention_days is not None and payload.retention_days <= 0:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "retention_days must be positive",
+            )
+        nonlocal trace_enabled, trace_retention_days
+        if config.config_file is not None:
+            await run_sync(
+                save_saved_trace_settings,
+                config.config_file,
+                payload.enabled,
+                payload.retention_days,
+            )
+        trace_enabled = payload.enabled
+        trace_retention_days = payload.retention_days
+        return session_store.configure_traces(
+            enabled=payload.enabled,
+            retention_days=payload.retention_days,
+        )
+
+    async def clear_trace_storage(request: Request) -> dict[str, object]:
+        ensure_same_origin(request)
+        return session_store.clear_traces()
+
+    async def pause_trace_backfill(request: Request) -> dict[str, object]:
+        ensure_same_origin(request)
+        session_store.pause_trace_backfill()
+        return session_store.trace_status()
+
+    async def resume_trace_backfill(request: Request) -> dict[str, object]:
+        ensure_same_origin(request)
+        session_store.resume_trace_backfill()
+        return session_store.trace_status()
+
+    async def rebuild_trace_history(request: Request) -> dict[str, object]:
+        ensure_same_origin(request)
+        _ = session_store.rebuild_trace_history()
+        await monitor.rebuild_trace_history()
+        return session_store.trace_status()
+
+    async def export_session_traces(session_key: str) -> Response:
+        session = session_store.get(session_key)
+        session_id = "session" if session is None else str(session.session_id)
+        if trace_store is not None:
+            stream = trace_store.export_session_stream(session_key, session_id)
+            if stream is not None:
+                return StreamingResponse(
+                    stream,
+                    media_type="application/json",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="trace-{session_id}.json"'
+                    },
+                )
+        payload = session_store.export_traces(session_key)
+        if payload is None and trace_store is not None:
+            persisted = trace_store.read_all_events(session_key)
+            if persisted:
+                payload = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "provider": "codex",
+                        "session_key": session_key,
+                        "events": persisted,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8")
+        if payload is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Session or trace storage not found")
+        return Response(
+            content=payload,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="trace-{session_id}.json"'},
+        )
+
+    async def get_trace_event(session_key: str, trace_id: str) -> dict[str, object]:
+        session = session_store.get(session_key)
+        event = (
+            None
+            if session is None
+            else next((item for item in session.trace_events if item.trace_id == trace_id), None)
+        )
+        if event is None and trace_store is not None:
+            event = next(
+                (
+                    item
+                    for item in trace_store.read_trace_events(session_key)
+                    if item.trace_id == trace_id
+                ),
+                None,
+            )
+        if event is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Trace event not found")
+        view = trace_page_events([event]).events[0]
+        return cast("dict[str, object]", view.model_dump())
+
+    async def get_trace_content(
+        session_key: str,
+        trace_id: str,
+        content: Literal["input", "result", "raw"] = "raw",
+        offset: Annotated[int, Query(ge=0)] = 0,
+        length: Annotated[int, Query(ge=1, le=262_144)] = 262_144,
+    ) -> dict[str, object]:
+        if trace_store is not None:
+            stored_chunk = trace_store.read_content_chunk(
+                session_key, trace_id, content, offset, length
+            )
+            if stored_chunk is not None:
+                text_chunk, total_length = stored_chunk
+                content_hash = trace_store.content_sha256(session_key, trace_id, content)
+                return {
+                    "trace_id": trace_id,
+                    "content": content,
+                    "offset": offset,
+                    "length": len(text_chunk),
+                    "total_length": total_length,
+                    "has_more": offset + len(text_chunk) < total_length,
+                    "next_offset": offset + len(text_chunk),
+                    "sha256": content_hash
+                    or hashlib.sha256(text_chunk.encode("utf-8")).hexdigest(),
+                    "value_type": "text",
+                    "text": text_chunk,
+                }
+        session = session_store.get(session_key)
+        event = (
+            None
+            if session is None
+            else next((item for item in session.trace_events if item.trace_id == trace_id), None)
+        )
+        if event is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Trace event not found")
+        value = event.raw_payload if content == "raw" else getattr(event, f"{content}_value")
+        text_value = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        )
+        chunk = text_value[offset : offset + length]
+        return {
+            "trace_id": trace_id,
+            "content": content,
+            "offset": offset,
+            "length": len(chunk),
+            "total_length": len(text_value),
+            "has_more": offset + len(chunk) < len(text_value),
+            "next_offset": offset + len(chunk),
+            "sha256": hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
+            "value_type": type(value).__name__,
+            "text": chunk,
+        }
 
     async def websocket_updates(websocket: WebSocket) -> None:
         nonlocal websocket_clients
@@ -593,16 +920,17 @@ def create_app(  # noqa: C901, PLR0915
                 return
         await websocket.accept(subprotocol=subprotocol)
         websocket_clients += 1
-        version = session_store.version
-        now = time.time()
-        initial = session_store.snapshot_event(
-            now,
-            activity_alert_seconds,
-            monitor.data_is_fresh(now),
-        )
-        await websocket.send_text(initial.model_dump_json())
-        context = WebSocketContext(websocket, session_store, config, monitor)
         try:
+            await monitor.wait_initial_sync()
+            version = session_store.version
+            now = time.time()
+            initial = session_store.snapshot_event(
+                now,
+                activity_alert_seconds,
+                monitor.data_is_fresh(now),
+            )
+            await websocket.send_text(initial.model_dump_json())
+            context = WebSocketContext(websocket, session_store, config, monitor)
             async with anyio.create_task_group() as task_group:
                 updates_task = task_group.start_soon(_send_updates, context, version)
                 del updates_task
@@ -623,6 +951,12 @@ def create_app(  # noqa: C901, PLR0915
     app.add_api_route("/api/config", app_config, methods=["GET"])
     app.add_api_route("/api/config/layout", save_layout_preferences, methods=["PUT"])
     app.add_api_route("/api/config/activity", save_activity_settings, methods=["PUT"])
+    app.add_api_route("/api/traces/status", get_trace_status, methods=["GET"])
+    app.add_api_route("/api/traces/settings", save_trace_settings, methods=["PUT"])
+    app.add_api_route("/api/traces/clear", clear_trace_storage, methods=["POST"])
+    app.add_api_route("/api/traces/backfill/pause", pause_trace_backfill, methods=["POST"])
+    app.add_api_route("/api/traces/backfill/resume", resume_trace_backfill, methods=["POST"])
+    app.add_api_route("/api/traces/rebuild", rebuild_trace_history, methods=["POST"])
     app.add_api_route("/api/health", health, methods=["GET"])
     app.add_api_route("/api/diagnostics", diagnostics, methods=["GET"])
     app.add_api_route("/api/diagnostics/export", export_diagnostics, methods=["POST"])
@@ -636,10 +970,67 @@ def create_app(  # noqa: C901, PLR0915
         methods=["GET"],
         response_model=SessionDetail,
     )
+    app.add_api_route(
+        "/api/sessions/{session_key}/traces",
+        get_session_traces,
+        methods=["GET"],
+        response_model=TracePage,
+    )
+    app.add_api_route(
+        "/api/traces/search",
+        search_traces,
+        methods=["POST"],
+        response_model=TraceSearchPage,
+    )
+    app.add_api_route(
+        "/api/sessions/{session_key}/traces/export",
+        export_session_traces,
+        methods=["GET"],
+    )
+    app.add_api_route(
+        "/api/sessions/{session_key}/traces/{trace_id}",
+        get_trace_event,
+        methods=["GET"],
+    )
+    app.add_api_route(
+        "/api/sessions/{session_key}/traces/{trace_id}/content",
+        get_trace_content,
+        methods=["GET"],
+    )
     app.add_api_route("/", dashboard, methods=["GET"])
     app.add_api_websocket_route("/ws", websocket_updates)
 
     return app
+
+
+def _encode_search_cursor(offset: int, fingerprint: str) -> str:
+    payload = json.dumps(
+        {"v": 1, "offset": offset, "fingerprint": fingerprint},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_search_cursor(cursor: str, fingerprint: str) -> int:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded = cast("object", json.loads(urlsafe_b64decode(padded).decode("utf-8")))
+        if not isinstance(decoded, dict):
+            raise _SearchCursorError
+        value = cast("dict[str, object]", decoded)
+        if (
+            value.get("v") != 1
+            or value.get("fingerprint") != fingerprint
+            or not isinstance(value.get("offset"), int)
+        ):
+            raise _SearchCursorError
+        offset = value.get("offset")
+        if not isinstance(offset, int):
+            raise _SearchCursorError
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise HTTPException(status.HTTP_409_CONFLICT, "cursor is invalid or expired") from None
+    else:
+        return offset
 
 
 async def _send_updates(context: WebSocketContext, start_version: int) -> None:

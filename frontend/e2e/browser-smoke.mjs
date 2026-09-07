@@ -575,11 +575,11 @@ try {
     JSON.stringify({ timestamp: new Date().toISOString(), type: "event_msg", payload: { type: "task_started", turn_id: "turn-live", started_at: liveStartedAt / 1000 } }),
     JSON.stringify({ timestamp: new Date().toISOString(), type: "event_msg", payload: { type: "user_message", message: "E2E live update" } }),
   ].join("\n") + "\n", "utf8");
-  await page.getByRole("main").getByText("E2E live update").waitFor({ timeout: 10000 });
+  await page.getByRole("main").getByRole("paragraph").filter({ hasText: "E2E live update" }).waitFor({ timeout: 10000 });
   for (let index = 0; index < 100; index += 1) {
     await appendFile(join(sessions, "session.jsonl"), `${JSON.stringify({ timestamp: new Date().toISOString(), type: "event_msg", payload: { type: "user_message", message: `E2E burst ${index}` } })}\n`, "utf8");
   }
-  await page.getByRole("main").getByText("E2E burst 99").waitFor({ timeout: 10000 });
+  await page.getByRole("main").getByRole("paragraph").filter({ hasText: "E2E burst 99" }).waitFor({ timeout: 10000 });
   const newSessionNotificationCount = await page.evaluate(() => window.Notification.calls.length);
   await appendFile(join(sessions, "session.jsonl"), [
     JSON.stringify({ timestamp: new Date().toISOString(), type: "event_msg", payload: { type: "task_started", turn_id: "turn-notify", started_at: Date.now() / 1000 } }),
@@ -620,7 +620,7 @@ try {
   for (let pageIndex = 0; pageIndex < 5; pageIndex += 1) {
     await Promise.all([
       page.waitForResponse((response) => response.url().includes("before=")),
-      page.getByRole("button", { name: "加载更早" }).click(),
+      page.getByRole("button", { name: "加载更早", exact: true }).click(),
     ]);
   }
   if (await page.locator("details.turn").count() !== 60) throw new Error("long timeline did not retain its 60-turn window");
@@ -710,7 +710,7 @@ try {
   for (let cycle = 1; cycle <= SOAK_CYCLES; cycle += 1) {
     const marker = `E2E soak ${cycle}`;
     await appendFile(join(sessions, "session.jsonl"), `${JSON.stringify({ timestamp: new Date(Date.UTC(2026, 6, 12, 0, 5, cycle)).toISOString(), type: "event_msg", payload: { type: "user_message", message: marker } })}\n`, "utf8");
-    await page.getByText(marker).waitFor({ timeout: 10000 });
+    await page.getByRole("main").getByRole("paragraph").filter({ hasText: marker }).waitFor({ timeout: 10000 });
     await stopServer();
     await page.locator(".connection").getByText("数据可能过期").waitFor({ timeout: 10000 });
     server = startServer();

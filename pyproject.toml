@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-session-monitor"
-version = "6.3.9.dev0"
+version = "1.1.0"
 description = "Local read-only dashboard for Codex sessions within one project."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anyio>=4.8",
-    "fastapi>=0.115,<0.116",
+    "fastapi>=0.115",
     "pydantic>=2.10",
     "rich>=13.9",
     "typer>=0.15",
@@ -25,7 +25,7 @@ codex-monitor = "codex_monitor.main:app"
 [dependency-groups]
 dev = [
     "basedpyright>=1.27",
-    "httpx>=0.28,<1",
+    "httpx2>=0.1",
     "pyinstaller>=6.21.0",
     "pytest>=9.0.3,<10",
     "pytest-cov>=6.0",

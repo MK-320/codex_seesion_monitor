@@ -102,10 +102,67 @@ export interface SessionDetail extends SessionSummary {
   next_before: number | null;
 }
 
+export type TraceStatus = "running" | "succeeded" | "failed" | "cancelled" | "interrupted" | "unknown";
+export type TraceParseState = "recognized" | "partially_recognized" | "unknown" | "invalid";
+
+export interface TraceEvent {
+  trace_id: string;
+  provider: string;
+  session_id: string;
+  turn_id: string | null;
+  sequence: number;
+  event_kind: string;
+  call_id: string | null;
+  related_trace_id?: string | null;
+  tool_name: string | null;
+  namespace: string | null;
+  status: TraceStatus;
+  started_at: number | null;
+  ended_at: number | null;
+  duration_ms: number | null;
+  input_value?: unknown;
+  result_value?: unknown;
+  raw_payload?: unknown;
+  input_preview?: string | null;
+  result_preview?: string | null;
+  raw_preview?: string | null;
+  content_available?: boolean;
+  content_metadata?: Record<string, unknown>;
+  source_line: number | null;
+  source_offset: number | null;
+  source_type: string | null;
+  parse_state: TraceParseState;
+  parallel_batch?: number | null;
+}
+
+export interface TracePage {
+  events: TraceEvent[];
+  total: number;
+  has_earlier: boolean;
+  next_before: number | null;
+  metadata_only: boolean;
+  query: string | null;
+  next_cursor?: string | null;
+  index_state?: "ready" | "building" | "unavailable";
+  data_freshness?: "live" | "historical" | "unavailable";
+}
+
+export interface TraceStorageStatus {
+  enabled: boolean;
+  retention_days: number | null;
+  used_bytes: number;
+  file_count: number;
+  root?: string;
+  index_state?: "ready" | "building" | "unavailable";
+  backfill_state?: "not_started" | "building" | "paused" | "complete" | "unavailable" | "error";
+  backfill?: { state: string; processed: number; total: number; error: string | null };
+}
+
 export interface MonitorConfig {
   activity_alert_seconds: number | null;
   layout: LayoutPreferences | null;
   projects: Project[];
+  trace?: TraceStorageStatus;
 }
 
 export interface LayoutPreferences {
@@ -155,4 +212,16 @@ export type RealtimeEvent =
       generated_at: number;
       session_key: string;
       data: SessionSummary;
+    }
+  | {
+      event: "trace_revision";
+      version: number;
+      protocol_version: 1;
+      generated_at: number;
+      session_key: string;
+      data: SessionSummary;
+      provider: string;
+      added_trace_ids: string[];
+      updated_trace_ids: string[];
+      last_sequence: number | null;
     };

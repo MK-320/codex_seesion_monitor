@@ -19,7 +19,7 @@ from codex_monitor.diagnostic_events import (
 from codex_monitor.discovery import SessionDiscovery
 from codex_monitor.events import parse_event_with_issue
 from codex_monitor.models import Session
-from codex_monitor.parser import apply_event, parse_file
+from codex_monitor.parser import apply_event, parse_file, record_trace_event
 from codex_monitor.store import ChangeKind, SessionStore
 from codex_monitor.tailer import read_complete_lines
 
@@ -68,8 +68,10 @@ class Monitor:
         "_diagnostic_emitter",
         "_discovery",
         "_initial_sync_complete",
+        "_initial_sync_event",
         "_known_paths",
         "_last_reconciliation_at",
+        "_path_locks",
         "_project_lock",
         "_reconciliation_count",
         "_store",
@@ -79,8 +81,10 @@ class Monitor:
     _diagnostic_emitter: DiagnosticEmitter | None
     _coalesced_event_count: int
     _discovery: SessionDiscovery
+    _initial_sync_event: anyio.Event
     _known_paths: set[Path]
     _last_reconciliation_at: float | None
+    _path_locks: dict[Path, anyio.Lock]
     _project_lock: anyio.Lock
     _reconciliation_count: int
     _store: SessionStore
@@ -105,7 +109,9 @@ class Monitor:
         self._store = store
         self._known_paths = set()
         self._initial_sync_complete = False
+        self._initial_sync_event = anyio.Event()
         self._last_reconciliation_at = None
+        self._path_locks = {}
         self._reconciliation_count = 0
         self._coalesced_event_count = 0
 
@@ -128,6 +134,9 @@ class Monitor:
         if not self._initial_sync_complete or self._last_reconciliation_at is None:
             return True
         return now - self._last_reconciliation_at <= DATA_STALE_AFTER_SECONDS
+
+    async def wait_initial_sync(self) -> None:
+        await self._initial_sync_event.wait()
 
     async def projects(self) -> tuple[Project, ...]:
         async with self._project_lock:
@@ -169,22 +178,36 @@ class Monitor:
                 await self._reconcile_locked(force_rebuild=True)
             return project
 
-    async def process_path(self, path: Path) -> ChangeKind | None:  # noqa: C901
+    async def rebuild_trace_history(self) -> None:
+        await self._reconcile(force_rebuild=True)
+
+    async def process_path(self, path: Path) -> ChangeKind | None:
+        normalized_path = _normalize_path(path)
+        path_lock = self._path_locks.setdefault(normalized_path, anyio.Lock())
+        async with path_lock:
+            return await self._process_path(normalized_path)
+
+    async def _process_path(self, path: Path) -> ChangeKind | None:  # noqa: C901
         started = time.perf_counter()
-        path = _normalize_path(path)
         file_size = await run_sync(_file_size, path)
         if file_size is None:
             return None
+        file_identity = await run_sync(_file_identity, path)
         project = await run_sync(self._discovery.project_for, path)
         if project is None:
             return None
         self._known_paths.add(path)
         existing = self._store.get_by_path(path)
-        if existing is None or file_size < existing.byte_offset:
+        identity_changed = existing is not None and existing.source_identity not in {
+            "",
+            file_identity,
+        }
+        if existing is None or file_size < existing.byte_offset or identity_changed:
             session = await run_sync(parse_file, path, project.key, project.root)
             if session is None:
                 self._emit("warn", "parser", "jsonl_parse_failed", error_summary="parse_failed")
                 return None
+            session.source_identity = file_identity
             self._emit_parse_anomalies(session)
             change = await self._store.put(session)
             self._emit("debug", "store", "store_update", self._elapsed_ms(started))
@@ -192,16 +215,46 @@ class Monitor:
 
         batch = await run_sync(read_complete_lines, path, existing.byte_offset)
         changed = False
-        for raw_line in batch.lines:
+        for line_index, raw_line in enumerate(batch.lines):
+            source_line = len(existing.trace_events) + line_index + 1
+            source_offset = (
+                batch.line_offsets[line_index]
+                if line_index < len(batch.line_offsets)
+                else existing.byte_offset
+            )
             event, issue = parse_event_with_issue(raw_line)
             if event is not None:
                 changed = apply_event(existing, event) or changed
+                _ = record_trace_event(
+                    existing,
+                    event,
+                    issue,
+                    raw_line,
+                    source_line=source_line,
+                    source_offset=source_offset,
+                )
             elif issue == "unknown":
                 existing.unknown_event_count += 1
+                _ = record_trace_event(
+                    existing,
+                    None,
+                    issue,
+                    raw_line,
+                    source_line=source_line,
+                    source_offset=source_offset,
+                )
                 changed = True
                 self._emit("warn", "parser", "jsonl_unknown_event", error_summary="unknown_event")
             elif issue == "malformed":
                 existing.malformed_line_count += 1
+                _ = record_trace_event(
+                    existing,
+                    None,
+                    issue,
+                    raw_line,
+                    source_line=source_line,
+                    source_offset=source_offset,
+                )
                 changed = True
                 self._emit("warn", "parser", "jsonl_line_malformed", error_summary="malformed_line")
         if batch.skipped_oversized:
@@ -209,6 +262,7 @@ class Monitor:
             changed = True
             self._emit("warn", "parser", "jsonl_line_oversized", error_summary="oversized_line")
         existing.byte_offset = batch.offset
+        existing.source_identity = file_identity
         if not changed:
             return None
         result = await self._store.put(existing)
@@ -219,10 +273,29 @@ class Monitor:
         async with self._project_lock:
             paths = {_normalize_path(path) for path in await run_sync(self._discovery.discover)}
             self._known_paths = paths
-            for path in sorted(paths, key=str):
-                _ = await self.process_path(path)
+            if not paths:
+                self._initial_sync_complete = True
+                self._initial_sync_event.set()
+                self._record_reconciliation()
+                self._store.complete_trace_backfill()
+                return
+            self._store.begin_trace_backfill(len(paths))
+            try:
+                for path in sorted(paths, key=str):
+                    while self._store.trace_backfill_is_paused():  # noqa: ASYNC110
+                        await anyio.sleep(0.1)
+                    _ = await self.process_path(path)
+                    self._store.advance_trace_backfill()
+            except Exception as error:
+                self._initial_sync_complete = True
+                self._initial_sync_event.set()
+                self._store.fail_trace_backfill(str(error))
+                raise
+            else:
+                self._initial_sync_complete = True
+                self._initial_sync_event.set()
+                self._store.complete_trace_backfill()
             self._record_reconciliation()
-            self._initial_sync_complete = True
 
     async def _reconcile(self, *, force_rebuild: bool = False) -> None:
         async with self._project_lock:
@@ -241,6 +314,7 @@ class Monitor:
             if project is not None:
                 session = await run_sync(parse_file, path, project.key, project.root)
                 if session is not None:
+                    session.source_identity = await run_sync(_file_identity, path)
                     self._emit_parse_anomalies(session)
                     sessions.append(session)
         self._known_paths = paths
@@ -254,8 +328,6 @@ class Monitor:
         self._reconciliation_count += 1
 
     async def run(self) -> None:
-        await self._initial_load()
-
         paths: SimpleQueue[Path] = SimpleQueue()
         handler = SessionFileHandler(paths)
         observer = Observer()
@@ -263,6 +335,7 @@ class Monitor:
             _ = observer.schedule(handler, str(self._config.session_root), recursive=True)
             observer.start()
         except Exception as error:
+            self._initial_sync_event.set()
             self._emit(
                 "error",
                 "watcher",
@@ -270,25 +343,28 @@ class Monitor:
                 error_summary=safe_exception_summary(error),
             )
             raise
-        next_poll = anyio.current_time() + 5
-        next_reconciliation = anyio.current_time() + 60
         try:
-            while True:
-                await self._drain(paths)
-                current_time = anyio.current_time()
-                if current_time >= next_reconciliation:
-                    await self._reconcile()
-                    next_reconciliation = current_time + 60
-                    next_poll = current_time + 5
-                elif current_time >= next_poll:
-                    await self._poll_known_files()
-                    next_poll = current_time + 5
-                _ = await self._store.refresh_stuck(
-                    now=time.time(),
-                    stuck_seconds=self._activity_alert_seconds,
-                    data_fresh=self.data_is_fresh(time.time()),
-                )
-                await anyio.sleep(0.2)
+            async with anyio.create_task_group() as task_group:
+                initial_load_task = task_group.start_soon(self._initial_load)
+                del initial_load_task
+                next_poll = anyio.current_time() + 5
+                next_reconciliation = anyio.current_time() + 60
+                while True:
+                    await self._drain(paths)
+                    current_time = anyio.current_time()
+                    if current_time >= next_reconciliation:
+                        await self._reconcile()
+                        next_reconciliation = current_time + 60
+                        next_poll = current_time + 5
+                    elif current_time >= next_poll:
+                        await self._poll_known_files()
+                        next_poll = current_time + 5
+                    _ = await self._store.refresh_stuck(
+                        now=time.time(),
+                        stuck_seconds=self._activity_alert_seconds,
+                        data_fresh=self.data_is_fresh(time.time()),
+                    )
+                    await anyio.sleep(0.2)
         finally:
             try:
                 observer.stop()
@@ -330,7 +406,14 @@ class Monitor:
         for path in tuple(self._known_paths):
             session = self._store.get_by_path(path)
             file_size = await run_sync(_file_size, path)
-            if file_size is not None and (session is None or file_size != session.byte_offset):
+            identity_changed = (
+                session is not None
+                and session.source_identity != ""
+                and session.source_identity != await run_sync(_file_identity, path)
+            )
+            if file_size is not None and (
+                session is None or file_size != session.byte_offset or identity_changed
+            ):
                 try:
                     _ = await self.process_path(path)
                 except Exception as error:  # noqa: BLE001 - isolate one bad file from polling
@@ -378,6 +461,16 @@ def _file_size(path: Path) -> int | None:
         return path.stat().st_size if path.is_file() else None
     except OSError:
         return None
+
+
+def _file_identity(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    if stat.st_ino:
+        return f"{stat.st_dev}:{stat.st_ino}"
+    return f"{stat.st_dev}:{stat.st_ctime_ns}"
 
 
 def _normalize_path(path: Path) -> Path:

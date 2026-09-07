@@ -1,6 +1,6 @@
 param(
     [string]$OutputPath = (Join-Path $env:USERPROFILE "codex-session-monitor-selfsigned.pfx"),
-    [string]$Subject = "CN=Codex Session Monitor",
+    [string]$Subject = "CN=Codex Session Monitor (Test Publisher)",
     [int]$ValidityDays = 730
 )
 
@@ -31,9 +31,9 @@ Export-PfxCertificate -Cert $certificate -FilePath $output -Password $password |
 $publicPath = [IO.Path]::ChangeExtension($output, ".cer")
 Export-Certificate -Cert $certificate -FilePath $publicPath | Out-Null
 
-Write-Output "Self-signed release certificate created."
+Write-Output "Self-signed test certificate created."
 Write-Output "PFX: $output"
 Write-Output "Public certificate: $publicPath"
 Write-Output "Publisher subject: $($certificate.Subject)"
 Write-Output "Thumbprint: $($certificate.Thumbprint)"
-Write-Output "This certificate identifies the formal release publisher but is self-signed and is not publicly trusted by Windows by default."
+Write-Output "This certificate is for local/internal testing and is not publicly trusted."

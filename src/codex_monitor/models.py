@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import NewType, final
@@ -36,6 +38,84 @@ class ToolStatus(StrEnum):
     PENDING = "pending"
     SUCCESS = "success"
     ERROR = "error"
+
+
+class TraceStatus(StrEnum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+class TraceParseState(StrEnum):
+    RECOGNIZED = "recognized"
+    PARTIALLY_RECOGNIZED = "partially_recognized"
+    UNKNOWN = "unknown"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class TraceEvent:
+    trace_id: str
+    provider: str
+    session_id: SessionId
+    turn_id: TurnId | None
+    sequence: int
+    event_kind: str
+    call_id: str | None
+    tool_name: str | None
+    namespace: str | None
+    status: TraceStatus
+    started_at: float | None
+    ended_at: float | None
+    input_value: object | None
+    result_value: object | None
+    raw_payload: object
+    source_line: int | None
+    source_offset: int | None
+    source_type: str | None
+    parse_state: TraceParseState
+    related_trace_id: str | None = None
+    _content_metadata_cache: dict[str, object] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @property
+    def duration_ms(self) -> int | None:
+        if self.started_at is None or self.ended_at is None:
+            return None
+        return max(0, round((self.ended_at - self.started_at) * 1000))
+
+    @property
+    def content_metadata(self) -> dict[str, object]:
+        if self._content_metadata_cache is not None:
+            return self._content_metadata_cache
+        values = [self.input_value, self.result_value, self.raw_payload]
+        encoded = [json_bytes(value) for value in values if value is not None]
+        metadata: dict[str, object] = {
+            "bytes": sum(len(item) for item in encoded),
+            "has_input": self.input_value is not None,
+            "has_result": self.result_value is not None,
+            "has_raw": self.raw_payload is not None,
+            "sha256": hashlib.sha256(
+                b"".join(json_bytes(value) for value in values if value is not None)
+            ).hexdigest(),
+        }
+        object.__setattr__(self, "_content_metadata_cache", metadata)
+        return metadata
+
+
+def json_size(value: object) -> int:
+    return len(json_bytes(value))
+
+
+def json_bytes(value: object) -> bytes:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+    except (TypeError, ValueError):
+        return str(value).encode("utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +213,9 @@ class Session:
         "pending_tool_started_at",
         "project_key",
         "project_root",
+        "source_identity",
         "status",
+        "trace_events",
         "turns",
         "unknown_event_count",
     )
@@ -141,12 +223,14 @@ class Session:
     metadata: SessionMetadata
     file_path: Path
     status: SessionStatus
+    trace_events: list[TraceEvent]
     turns: list[Turn]
     last_event_at: float
     last_progress_at: float
     activity_since: float
     pending_tool_name: ToolName | None
     pending_tool_started_at: float | None
+    source_identity: str
     approx_context_chars: int
     byte_offset: int
     unknown_event_count: int
@@ -165,7 +249,9 @@ class Session:
         self.file_path = file_path
         self.project_key = project_key
         self.project_root = project_root or Path(metadata.cwd)
+        self.source_identity = ""
         self.status = SessionStatus.UNKNOWN
+        self.trace_events = []
         self.turns = []
         self.last_event_at = last_event_at
         self.last_progress_at = last_event_at

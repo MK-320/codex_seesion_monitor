@@ -78,12 +78,31 @@ class FunctionCallOutputPayload(BoundaryModel):
     output: object = ""
 
 
+class ToolDiscoveryPayload(BoundaryModel):
+    type: Literal[
+        "tool_search",
+        "tool_search_result",
+        "web_search",
+        "web_search_result",
+        "available_tools",
+        "tool_list",
+    ]
+    name: str | None = None
+    query: str | None = None
+    call_id: str | None = None
+    input: object | None = None
+    output: object | None = None
+    tools: object | None = None
+    results: object | None = None
+
+
 type EventPayload = Annotated[
     TaskStartedPayload
     | UserMessagePayload
     | AgentMessagePayload
     | TaskCompletePayload
-    | TurnAbortedPayload,
+    | TurnAbortedPayload
+    | ToolDiscoveryPayload,
     Field(discriminator="type"),
 ]
 
@@ -95,7 +114,7 @@ class EventMessageEvent(BoundaryModel):
 
 
 type ResponsePayload = Annotated[
-    ResponseMessagePayload | FunctionCallPayload | FunctionCallOutputPayload,
+    ResponseMessagePayload | FunctionCallPayload | FunctionCallOutputPayload | ToolDiscoveryPayload,
     Field(discriminator="type"),
 ]
 
@@ -149,6 +168,12 @@ def _is_unknown_event(value: dict[str, object]) -> bool:
             "agent_message",
             "task_complete",
             "turn_aborted",
+            "tool_search",
+            "tool_search_result",
+            "web_search",
+            "web_search_result",
+            "available_tools",
+            "tool_list",
         }
     if event_type == "response_item":
         return payload_type not in {
@@ -157,5 +182,11 @@ def _is_unknown_event(value: dict[str, object]) -> bool:
             "custom_tool_call",
             "function_call_output",
             "custom_tool_call_output",
+            "tool_search",
+            "tool_search_result",
+            "web_search",
+            "web_search_result",
+            "available_tools",
+            "tool_list",
         }
     return False

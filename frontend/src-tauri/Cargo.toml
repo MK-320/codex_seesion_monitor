@@ -1,6 +1,6 @@
 [package]
 name = "codex-session-monitor"
-version = "6.3.9-dev.0"
+version = "1.1.0"
 description = "Desktop shell for Codex Session Monitor"
 edition = "2021"
 
