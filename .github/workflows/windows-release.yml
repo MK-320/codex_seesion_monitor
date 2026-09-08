@@ -41,10 +41,10 @@ jobs:
           fi
 
           git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed-files.txt"
-          if grep -Eq '^(src/|frontend/src/|frontend/src-tauri/|frontend/public/|frontend/package\.json$|frontend/package-lock\.json$|frontend/vite\.|frontend/tsconfig|frontend/index\.html$|scripts/|pyproject\.toml$|uv\.lock$)' "$RUNNER_TEMP/changed-files.txt"; then
+          if grep -Eq '^(src/|frontend/src/|frontend/src-tauri/|frontend/public/|frontend/package\.json$|frontend/vite\.|frontend/tsconfig|frontend/index\.html$|scripts/|pyproject\.toml$|uv\.lock$)' "$RUNNER_TEMP/changed-files.txt"; then
             echo "run_unsigned=true" >> "$GITHUB_OUTPUT"
             echo "Installer-affecting files changed:"
-            grep -E '^(src/|frontend/src/|frontend/src-tauri/|frontend/public/|frontend/package\.json$|frontend/package-lock\.json$|frontend/vite\.|frontend/tsconfig|frontend/index\.html$|scripts/|pyproject\.toml$|uv\.lock$)' "$RUNNER_TEMP/changed-files.txt"
+            grep -E '^(src/|frontend/src/|frontend/src-tauri/|frontend/public/|frontend/package\.json$|frontend/vite\.|frontend/tsconfig|frontend/index\.html$|scripts/|pyproject\.toml$|uv\.lock$)' "$RUNNER_TEMP/changed-files.txt"
           else
             echo "run_unsigned=false" >> "$GITHUB_OUTPUT"
             echo "No installer-affecting files changed; skipping NSIS build."
