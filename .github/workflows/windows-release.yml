@@ -482,6 +482,7 @@ jobs:
           $signaturePath = "$($updaterInstaller.FullName).sig"
           if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Updater signature is missing." }
           $signature = Get-Content -LiteralPath $signaturePath -Raw
+          $publishedInstallerName = $updaterInstaller.Name.Replace(" ", ".")
           [ordered]@{
             version = "${{ github.ref_name }}".TrimStart("v")
             notes = "See the GitHub release notes."
@@ -489,7 +490,7 @@ jobs:
             platforms = @{
               "windows-x86_64" = @{
                 signature = $signature.Trim()
-                url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($updaterInstaller.Name)"
+                url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$publishedInstallerName"
               }
             }
           } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bundleRoot/latest.json" -Encoding utf8
@@ -497,12 +498,12 @@ jobs:
             Where-Object { $_.Name -notin @("checksums.sha256", "release-manifest.json") }
           $artifactDetails = @($releaseFiles | ForEach-Object {
             [ordered]@{
-              name = $_.Name
+              name = $_.Name.Replace(" ", ".")
               sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
             }
           })
           $releaseFiles | Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "{0} *{1}" -f $_.Hash, (Split-Path -Leaf $_.Path) } |
+            ForEach-Object { "{0} *{1}" -f $_.Hash, (Split-Path -Leaf $_.Path).Replace(" ", ".") } |
             Set-Content -LiteralPath "$bundleRoot/checksums.sha256" -Encoding utf8
           [ordered]@{
             version = "${{ github.ref_name }}".TrimStart("v")
