@@ -200,10 +200,10 @@ jobs:
               $trustedCertificatePath,
               $certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
             )
-            Import-Certificate -FilePath $trustedCertificatePath -CertStoreLocation Cert:\CurrentUser\Root |
-              Out-Null
-            Import-Certificate -FilePath $trustedCertificatePath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher |
-              Out-Null
+            & certutil.exe -f -user -addstore Root $trustedCertificatePath | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Unable to trust self-signed root certificate." }
+            & certutil.exe -f -user -addstore TrustedPublisher $trustedCertificatePath | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Unable to trust self-signed publisher certificate." }
           }
       - name: Verify tag source
         shell: pwsh
