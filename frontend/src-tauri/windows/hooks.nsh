@@ -1,7 +1,16 @@
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
 
+; A normal window close hides the app in the tray by design. During install or
+; uninstall we must terminate both the shell and its sidecar process tree so
+; onedir DLLs are not left locked by a hidden instance.
+!macro NSIS_HOOK_STOP_APP_PROCESSES
+  ExecWait '"$SYSDIR\taskkill.exe" /F /T /IM "Codex Session Monitor.exe"' $R9
+  ExecWait '"$SYSDIR\taskkill.exe" /F /T /IM "codex-monitor-sidecar-x86_64-pc-windows-msvc.exe"' $R9
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
+  !insertmacro NSIS_HOOK_STOP_APP_PROCESSES
   ${IfNot} ${Silent}
     ${GetParameters} $R0
     ClearErrors
@@ -17,6 +26,7 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro NSIS_HOOK_STOP_APP_PROCESSES
   ${IfNot} ${Silent}
     ${GetParameters} $R0
     ClearErrors

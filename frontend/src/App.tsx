@@ -75,7 +75,7 @@ import type {
   RecoveryStatus,
   UpdateDownloadProgress,
 } from "./desktop";
-import type { AttentionContext, DiagnosticsReport, MonitorConfig, Project, SessionDetail, SessionSummary, ToolCall, Turn } from "./types";
+import type { AttentionContext, DiagnosticsReport, MonitorConfig, Project, SessionDetail, SessionSummary, ToolCall, TraceEvent, TracePage, TraceStorageStatus, Turn } from "./types";
 import { isAttentionContext, MAX_ATTENTION_REGISTRY_ENTRIES, useAttentionRegistry } from "./useAttentionRegistry";
 import { ACTIVITY_BASELINE_RESET_EVENT, useAttentionNotifications } from "./useAttentionNotifications";
 import { useMonitorConfig, useSessionDetail, useSessions } from "./useSessions";
@@ -92,7 +92,7 @@ const COMPACT_LAYOUT_MAX_WIDTH_REM = 45;
 const LAST_DISMISSED_UPDATE_KEY = "last-dismissed-update-version";
 const DIALOG_EXIT_DURATION_MS = 180;
 const AUTHOR_EMAIL = "drgeek320@163.com";
-const REPOSITORY_URL = "https://github.com/MK-320/codex_seesion_monitor";
+const REPOSITORY_URL = "https://github.com/MK-320/codex_multiple_thread_monitor";
 
 function rootFontSize(): number {
   return Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
@@ -581,6 +581,241 @@ function TurnTimeline({ turn, target, onTarget }: { turn: Turn; target: Attentio
   );
 }
 
+function traceValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? "";
+  } catch {
+    return String(value);
+  }
+}
+
+function traceGroups(events: TraceEvent[]): TraceEvent[][] {
+  const groups = new Map<string, TraceEvent[]>();
+  for (const event of events) {
+    const key = event.parallel_batch === null || event.parallel_batch === undefined
+      ? `event-${event.sequence}`
+      : `batch-${event.parallel_batch}`;
+    const group = groups.get(key) ?? [];
+    group.push(event);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
+}
+
+type TraceViewMode = "parallel" | "strict" | "raw" | "discovery";
+
+function LazyTraceContent({
+  sessionKey,
+  traceId,
+  content,
+  label,
+}: {
+  sessionKey: string;
+  traceId: string;
+  content: "input" | "result" | "raw";
+  label: string;
+}) {
+  const [text, setText] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const readChunk = async () => {
+    if (loading || !hasMore) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await apiFetch(
+        `/api/sessions/${encodeURIComponent(sessionKey)}/traces/${encodeURIComponent(traceId)}/content?content=${content}&offset=${offset}&length=262144`,
+      );
+      if (!response.ok) throw new Error("trace content request failed");
+      const chunk = await response.json() as {
+        text: string;
+        length: number;
+        has_more: boolean;
+      };
+      setText(chunk.text);
+      setOffset((current) => current + chunk.length);
+      setHasMore(chunk.has_more);
+    } catch (requestError: unknown) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Trace content read failed",
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <details className="data-block trace-lazy-content">
+      <summary>
+        <span>{label}</span>
+        <button
+          type="button"
+          onClick={(click) => {
+            click.preventDefault();
+            void readChunk();
+          }}
+          disabled={loading}
+        >
+          {loading ? "Loading…" : text ? "Next chunk" : "Read content"}
+        </button>
+      </summary>
+      {error !== null && <small className="trace-error" role="alert">{error}</small>}
+      {text && <pre>{text}</pre>}
+      {text && hasMore && (
+        <button
+          type="button"
+          className="trace-content-more"
+          onClick={() => {
+            void readChunk();
+          }}
+          disabled={loading}
+        >
+          Next chunk
+        </button>
+      )}
+    </details>
+  );
+}
+
+function TraceCard({ event, sessionKey, showRaw = false }: { event: TraceEvent; sessionKey: string; showRaw?: boolean }) {
+  const [detail, setDetail] = useState<TraceEvent | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inputValue = detail?.input_value ?? event.input_value ?? event.input_preview;
+  const resultValue = detail?.result_value ?? event.result_value ?? event.result_preview;
+  const rawValue = detail?.raw_payload ?? event.raw_payload ?? event.raw_preview;
+  const input = inputValue === null || inputValue === undefined ? "" : traceValue(inputValue);
+  const result = resultValue === null || resultValue === undefined ? "" : traceValue(resultValue);
+  const raw = rawValue === null || rawValue === undefined ? "" : traceValue(rawValue);
+  const loadDetail = async () => {
+    if (detail !== null || loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await apiFetch(`/api/sessions/${encodeURIComponent(sessionKey)}/traces/${encodeURIComponent(event.trace_id)}`);
+      if (!response.ok) throw new Error("trace detail request failed");
+      const metadata = await response.json() as TraceEvent;
+      setDetail(metadata);
+    } catch (requestError: unknown) {
+      setError(requestError instanceof Error ? requestError.message : "Trace 读取失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+  return <article className={`trace-card trace-${event.status}`}>
+    <header><span className="trace-sequence">#{event.sequence}</span><strong>{event.tool_name ?? event.event_kind}</strong><small>{event.status}</small></header>
+    <div className="trace-meta"><span>{event.provider}</span>{event.namespace && <span>{event.namespace}</span>}{event.duration_ms !== null && <span>{event.duration_ms} ms</span>}{event.parallel_batch !== null && event.parallel_batch !== undefined && <span>并行批次 {event.parallel_batch}</span>}{event.source_line !== null && <span>第 {event.source_line} 行</span>}</div>
+    <div className="trace-content-summary"><span>内容 {String(event.content_metadata?.bytes ?? 0)} bytes</span><span>{event.source_type ?? "来源不可用"}</span><button type="button" onClick={() => { void loadDetail(); }} disabled={loading}>{loading ? "正在读取…" : detail === null ? "查看完整内容" : "已加载完整内容"}</button></div>
+    {error !== null && <small className="trace-error" role="alert">{error}</small>}
+    {input && <DataBlock label="参数预览" text={input} />}
+    {result && <DataBlock label="结果预览" text={result} tone={event.status} />}
+    {(showRaw || event.parse_state !== "recognized") && raw && <DataBlock label="原始事件预览" text={raw} />}
+    {event.parse_state !== "recognized" && <small className="trace-parse-state">解析状态：{event.parse_state}</small>}
+    {detail !== null && Boolean(detail.content_metadata?.has_input) && <LazyTraceContent sessionKey={sessionKey} traceId={event.trace_id} content="input" label="Input" />}
+    {detail !== null && Boolean(detail.content_metadata?.has_result) && <LazyTraceContent sessionKey={sessionKey} traceId={event.trace_id} content="result" label="Result" />}
+    {detail !== null && Boolean(detail.content_metadata?.has_raw) && <LazyTraceContent sessionKey={sessionKey} traceId={event.trace_id} content="raw" label="Raw event" />}
+  </article>;
+}
+
+function TraceExplorer({ sessionKey }: { sessionKey: string }) {
+  const [page, setPage] = useState<TracePage | null>(null);
+  const [query, setQuery] = useState("");
+  const [metadataOnly, setMetadataOnly] = useState(false);
+  const [eventKind, setEventKind] = useState("");
+  const [traceStatusFilter, setTraceStatusFilter] = useState("");
+  const [viewMode, setViewMode] = useState<TraceViewMode>("parallel");
+  const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const nextCursorRef = useRef<string | null>(null);
+  const requestSerialRef = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const loadPage = useCallback((append: boolean) => {
+    const requestSerial = requestSerialRef.current + 1;
+    requestSerialRef.current = requestSerial;
+    if (!append) activeControllerRef.current?.abort();
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    if (append) setLoadingMore(true); else setLoading(true);
+    const params = new URLSearchParams({ limit: "100" });
+    if (append && nextCursorRef.current !== null) params.set("cursor", nextCursorRef.current);
+    if (query.trim()) params.set("query", query.trim());
+    if (metadataOnly) params.set("metadata_only", "true");
+    const requestedEventKind = viewMode === "discovery" ? "discovery" : eventKind;
+    if (requestedEventKind) params.set("event_kind", requestedEventKind);
+    if (traceStatusFilter) params.set("trace_status", traceStatusFilter);
+    void apiFetch(`/api/sessions/${encodeURIComponent(sessionKey)}/traces?${params}`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<TracePage> : Promise.reject(new Error("trace request failed")))
+      .then((incoming) => {
+        if (requestSerial !== requestSerialRef.current) return;
+        setPage((current) => append && current !== null
+          ? { ...incoming, events: [...incoming.events, ...current.events] }
+          : incoming);
+        nextCursorRef.current = incoming.next_cursor ?? null;
+        setNextCursor(incoming.next_cursor ?? null);
+      })
+      .catch((error: unknown) => {
+        if (requestSerial !== requestSerialRef.current) return;
+        if (!(error instanceof DOMException && error.name === "AbortError")) setPage(null);
+      })
+      .finally(() => {
+        if (requestSerial !== requestSerialRef.current) return;
+        setLoading(false);
+        setLoadingMore(false);
+        if (activeControllerRef.current === controller) activeControllerRef.current = null;
+      });
+    return () => controller.abort();
+  }, [eventKind, metadataOnly, query, sessionKey, traceStatusFilter, viewMode]);
+  useEffect(() => {
+    setNextCursor(null);
+    nextCursorRef.current = null;
+    return loadPage(false);
+  }, [loadPage]);
+  useEffect(() => {
+    const onRevision = (event: Event) => {
+      const detail = (event as CustomEvent<{ session_key?: string }>).detail;
+      if (detail?.session_key === sessionKey) void loadPage(false);
+    };
+    window.addEventListener("codex-trace-revision", onRevision);
+    return () => window.removeEventListener("codex-trace-revision", onRevision);
+  }, [loadPage, sessionKey]);
+  const events = page?.events ?? [];
+  const strictOrder = viewMode !== "parallel";
+  const groups = strictOrder ? events.map((event) => [event]) : traceGroups(events);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const exportTrace = async () => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const response = await apiFetch(`/api/sessions/${encodeURIComponent(sessionKey)}/traces/export`);
+      if (!response.ok) throw new Error("trace export failed");
+      const url = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `trace-${sessionKey.replace(/[^A-Za-z0-9._-]+/g, "_")}.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (error: unknown) {
+      setExportError(error instanceof Error ? error.message : "Trace 导出失败");
+    } finally {
+      setExporting(false);
+    }
+  };
+  return <section className="trace-explorer" aria-label="Tool Trace">
+    <header className="trace-toolbar"><div><h3>Tool Trace</h3><small>{page?.total ?? 0} 条事件 · {viewMode === "parallel" ? "并行泳道" : viewMode === "strict" ? "严格时序" : viewMode === "raw" ? "原始事件" : "工具发现"} · 本机完整记录 · {page?.index_state ?? "ready"}</small></div><label><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索参数、结果、工具…" aria-label="搜索 Trace" /></label><label><select aria-label="Trace 视图" value={viewMode} onChange={(event) => setViewMode(event.target.value as TraceViewMode)}><option value="parallel">并行泳道</option><option value="strict">严格时序</option><option value="raw">原始事件</option><option value="discovery">工具发现</option></select></label><label><select aria-label="事件类型" value={eventKind} onChange={(event) => setEventKind(event.target.value)} disabled={viewMode === "discovery"}><option value="">全部事件</option><option value="function_call">工具调用</option><option value="custom_tool_call">自定义工具调用</option><option value="function_call_output">工具结果</option><option value="custom_tool_call_output">自定义工具结果</option><option value="event_msg">消息事件</option><option value="tool_search">工具搜索</option><option value="web_search">Web 搜索</option><option value="available_tools">可用工具</option><option value="unknown">未知事件</option></select></label><label><select aria-label="Trace 状态" value={traceStatusFilter} onChange={(event) => setTraceStatusFilter(event.target.value)}><option value="">全部状态</option><option value="running">运行中</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option><option value="unknown">未知</option></select></label><label><input type="checkbox" checked={metadataOnly} onChange={(event) => setMetadataOnly(event.target.checked)} />仅元数据</label><button type="button" className="trace-export" onClick={() => { void exportTrace(); }} disabled={exporting}>{exporting ? "正在导出…" : "导出 Trace"}</button></header>
+    {exportError !== null && <p className="trace-error" role="alert">{exportError}</p>}
+    {loading && <p className="loading">正在加载 Trace…</p>}
+    {!loading && events.length === 0 && <p className="loading">没有匹配的 Trace 事件</p>}
+    <div className={`trace-list ${strictOrder ? "strict" : ""} trace-view-${viewMode}`}>{groups.map((group, index) => <div className="trace-batch" key={`${group[0]?.trace_id ?? "empty"}-${index}`}><small className="trace-batch-label">{strictOrder ? (viewMode === "raw" ? "原始事件" : viewMode === "discovery" ? "工具发现" : "时序") : group[0]?.parallel_batch ? `并行批次 ${group[0].parallel_batch}` : "时序事件"}</small>{group.map((event) => <TraceCard key={event.trace_id} event={event} sessionKey={sessionKey} showRaw={viewMode === "raw"} />)}</div>)}</div>
+    {page?.has_earlier && <button type="button" className="trace-load-more" disabled={loadingMore} onClick={() => { void loadPage(true); }}>{loadingMore ? "正在加载…" : "加载更早事件"}</button>}
+  </section>;
+}
+
 function CopyButton({ label, text, disabled = false, disabledTitle }: { label: string; text: string; disabled?: boolean; disabledTitle?: string }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
   const title = disabled ? disabledTitle : state === "copied" ? "已复制" : state === "failed" ? "复制失败" : label;
@@ -696,12 +931,26 @@ function Workspace({ session, detail, detailState, anchorState, attentionSelecti
       || detailState !== "ready"
       || !targetFound
       || lastLocatedSelection.current === attentionSelection.nonce
+      || timeline.current === null
     ) {
       return;
     }
     // Mark only after the target exists so a missed rAF/ref race can still retry.
     lastLocatedSelection.current = attentionSelection.nonce;
-    element.scrollIntoView({ block: "center" });
+    const scroller = timeline.current;
+    if (scroller.closest(".compact-layout") !== null) {
+      element.scrollIntoView({ block: "center" });
+    } else {
+      // Only the timeline owns scrolling; scrollIntoView also scrolls clipped ancestors.
+      const viewport = scroller.getBoundingClientRect();
+      const target = element.getBoundingClientRect();
+      const toolbarHeight = (scroller.querySelector(".timeline-actions")?.getBoundingClientRect().height ?? 0)
+        + Number.parseFloat(window.getComputedStyle(scroller).paddingTop);
+      const freeSpace = Math.max(0, scroller.clientHeight - toolbarHeight - target.height);
+      scroller.scrollTo({
+        top: scroller.scrollTop + target.top - viewport.top - scroller.clientTop - toolbarHeight - freeSpace / 2,
+      });
+    }
     element.focus({ preventScroll: true });
     element.classList.add("attention-target-highlight");
     window.setTimeout(() => element.classList.remove("attention-target-highlight"), 1800);
@@ -904,6 +1153,7 @@ function Workspace({ session, detail, detailState, anchorState, attentionSelecti
         {detail?.has_earlier && <button className="load-earlier" type="button" onClick={() => { void onLoadEarlier(); }}>加载更早</button>}
         {detail?.turns.filter((turn) => !errorsOnly || turn.tool_calls.some((tool) => tool.status === "error") || context?.turn_id === turn.turn_id).map((turn) => <TurnTimeline key={turn.turn_id} turn={turn} target={context} onTarget={locateAttentionTarget} />)}
         <div ref={(element) => { latest.current = element; if (context?.reason === "stuck" && context.turn_id === null) locateAttentionTarget(element); }} tabIndex={context?.reason === "stuck" && context.turn_id === null ? -1 : undefined} />
+        <TraceExplorer sessionKey={session.session_key} />
       </section>
     </main>
   );
@@ -945,6 +1195,9 @@ function DiagnosticsDialog({
   const [newCount, setNewCount] = useState(0);
   const [capacityMb, setCapacityMb] = useState("50");
   const [activityAlertSeconds, setActivityAlertSeconds] = useState<number | null>(300);
+  const [traceStatus, setTraceStatus] = useState<TraceStorageStatus | null>(null);
+  const [traceEnabled, setTraceEnabled] = useState(true);
+  const [traceRetention, setTraceRetention] = useState("permanent");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -993,12 +1246,29 @@ function DiagnosticsDialog({
         if (!(reason instanceof DOMException && reason.name === "AbortError")) setError("诊断概览加载失败");
       });
     apiFetch("/api/config", { signal: controller.signal })
-      .then((response) => response.json() as Promise<{ activity_alert_seconds?: number | null }>)
-      .then((config) => setActivityAlertSeconds(config.activity_alert_seconds ?? 300))
+      .then((response) => response.json() as Promise<{ activity_alert_seconds?: number | null; trace?: TraceStorageStatus }>)
+      .then((config) => {
+        setActivityAlertSeconds(config.activity_alert_seconds ?? 300);
+        if (config.trace) {
+          setTraceStatus(config.trace);
+          setTraceEnabled(config.trace.enabled);
+          setTraceRetention(config.trace.retention_days === null ? "permanent" : String(config.trace.retention_days));
+        }
+      })
       .catch((reason: unknown) => {
         if (!(reason instanceof DOMException && reason.name === "AbortError")) setError("会话提醒设置加载失败");
       });
     void loadStatus().catch(() => setError("本地日志状态加载失败"));
+    apiFetch("/api/traces/status", { signal: controller.signal })
+      .then((response) => response.json() as Promise<TraceStorageStatus>)
+      .then((status) => {
+        setTraceStatus(status);
+        setTraceEnabled(status.enabled);
+        setTraceRetention(status.retention_days === null ? "permanent" : String(status.retention_days));
+      })
+      .catch((reason: unknown) => {
+        if (!(reason instanceof DOMException && reason.name === "AbortError")) setError("Tool Trace 状态加载失败");
+      });
     return () => controller.abort();
   }, [loadStatus]);
 
@@ -1077,6 +1347,51 @@ function DiagnosticsDialog({
       onNotice({ kind: "success", title: "会话提醒已更新", message: value === null ? "已关闭长时间无进展提醒" : `已设置为 ${Math.round(value / 60)} 分钟` });
     } catch {
       onNotice({ kind: "error", title: "保存会话提醒失败", message: "本次设置未生效，请稍后重试" });
+    }
+  };
+
+  const saveTraceSettings = async () => {
+    const retention = traceRetention === "permanent" ? null : Number(traceRetention);
+    if (retention !== null && (!Number.isInteger(retention) || retention <= 0)) {
+      onNotice({ kind: "warning", title: "保留时长无效", message: "请输入正整数天数或选择永久保留" });
+      return;
+    }
+    try {
+      const response = await apiFetch("/api/traces/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: traceEnabled, retention_days: retention }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const status = await response.json() as TraceStorageStatus;
+      setTraceStatus(status);
+      onNotice({ kind: "success", title: "Tool Trace 设置已保存", message: traceEnabled ? "已开启本机完整记录" : "已暂停新 Trace 记录" });
+    } catch {
+      onNotice({ kind: "error", title: "保存 Tool Trace 设置失败", message: "本次设置未生效" });
+    }
+  };
+
+  const clearTraceStorage = async () => {
+    try {
+      const response = await apiFetch("/api/traces/clear", { method: "POST" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const status = await response.json() as TraceStorageStatus;
+      setTraceStatus(status);
+      onNotice({ kind: "success", title: "追踪记录已清除", message: "只删除应用 Trace 与索引，不影响 Codex 原始会话日志" });
+    } catch {
+      onNotice({ kind: "error", title: "清除追踪记录失败", message: "原有记录仍保留" });
+    }
+  };
+
+  const setBackfillPaused = async (pause: boolean) => {
+    try {
+      const response = await apiFetch(`/api/traces/backfill/${pause ? "pause" : "resume"}`, { method: "POST" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const status = await response.json() as TraceStorageStatus;
+      setTraceStatus(status);
+      onNotice({ kind: "success", title: pause ? "历史回填已暂停" : "历史回填已恢复", message: pause ? "后台索引构建已暂停，可随时恢复" : "后台索引构建已恢复" });
+    } catch {
+      onNotice({ kind: "error", title: "历史回填操作失败", message: "本次操作未生效，请稍后重试" });
     }
   };
 
@@ -1278,6 +1593,13 @@ function DiagnosticsDialog({
             <section className="diagnostics-settings-card diagnostics-settings-actions" aria-labelledby="diagnostics-settings-actions-title">
               <div className="diagnostics-settings-card-heading"><div><h4 id="diagnostics-settings-actions-title">本机日志操作</h4><p>打开、复制或清空当前设备上的诊断日志。</p></div><FolderSimple size={20} weight="duotone" aria-hidden="true" /></div>
               <div className="diagnostics-log-actions"><button type="button" onClick={() => { void openDiagnosticLogDirectory().then(() => onNotice({ kind: "success", title: "日志目录已打开", message: "已在文件管理器中打开本机日志目录" })).catch(() => onNotice({ kind: "error", title: "打开日志目录失败", message: "请确认应用具有访问本机文件的权限" })); }}>打开日志目录</button><button type="button" disabled={copying} onClick={() => { void copySummary(); }}>{copying ? "正在复制…" : "复制脱敏摘要"}</button><button type="button" disabled={clearing} onClick={() => { void clearLogs(); }}>{clearing ? "正在清空…" : "清空日志"}</button></div>
+            </section>
+            <section className="diagnostics-settings-card diagnostics-settings-trace" aria-labelledby="trace-settings-title">
+              <div className="diagnostics-settings-card-heading"><div><h4 id="trace-settings-title">Tool Trace</h4><p>完整保存 Codex 工具调用，仅保存在本机，不会自动上传或同步。</p></div><Code size={20} weight="duotone" aria-hidden="true" /></div>
+              <div className="diagnostics-settings-policy-details"><div><span>当前占用</span><strong>{((traceStatus?.used_bytes ?? 0) / 1024 / 1024).toFixed(2)} MB</strong><small>{traceStatus?.file_count ?? 0} 个会话文件</small></div><div><span>默认行为</span><strong>{traceEnabled ? "已开启" : "已暂停"}</strong><small>不丢事件，后台追加保存</small></div><div><span>索引与历史</span><strong>{traceStatus?.index_state === "ready" ? "就绪" : "不可用"}</strong><small>历史回填：{traceStatus?.backfill ? `${traceStatus.backfill.processed}/${traceStatus.backfill.total} · ${traceStatus.backfill.state}` : traceStatus?.backfill_state === "complete" ? "已完成" : "未开始"}</small></div></div>
+              <label className="diagnostics-debug-toggle diagnostics-settings-debug-row"><input type="checkbox" checked={traceEnabled} onChange={(event) => setTraceEnabled(event.target.checked)} /><span><strong>开启 Tool Trace</strong><small>保留完整参数、结果和未知事件</small></span></label>
+              <div className="diagnostics-settings-capacity-control"><label><span>保留时长</span><select value={traceRetention} onChange={(event) => setTraceRetention(event.target.value)}><option value="permanent">永久</option><option value="7">7 天</option><option value="30">30 天</option><option value="90">90 天</option><option value="365">365 天</option></select></label><button type="button" onClick={() => { void saveTraceSettings(); }}>保存 Trace 设置</button><button type="button" onClick={() => { void clearTraceStorage(); }}>清除全部追踪记录</button></div>
+              {(traceStatus?.backfill_state === "building" || traceStatus?.backfill_state === "paused") && <div className="diagnostics-settings-capacity-control"><small>历史回填不会丢失原始事件，可在后台继续构建索引。</small>{traceStatus.backfill_state === "building" ? <button type="button" onClick={() => { void setBackfillPaused(true); }}>暂停历史回填</button> : <button type="button" onClick={() => { void setBackfillPaused(false); }}>恢复历史回填</button>}</div>}
             </section>
           </>}
           <details className="diagnostics-settings-card diagnostics-settings-privacy">

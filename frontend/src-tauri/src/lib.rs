@@ -102,14 +102,25 @@ impl DesktopRuntime {
     }
 
     fn kill(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            if let Some(child) = child.take() {
-                let mut child = child;
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        let child = self.child.lock().ok().and_then(|mut state| state.take());
+        if let Some(child) = child {
+            terminate_child_process_tree(child);
         }
     }
+}
+
+fn terminate_child_process_tree(mut child: Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[tauri::command]
@@ -669,8 +680,7 @@ fn start_sidecar(app: &tauri::AppHandle, runtime: &DesktopRuntime) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = match command.spawn()
-    {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
             runtime.set_connection(Err(START_FAILED));
@@ -687,8 +697,7 @@ fn start_sidecar(app: &tauri::AppHandle, runtime: &DesktopRuntime) {
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_process_tree(child);
             runtime.set_connection(Err(START_FAILED));
             record_diagnostic(
                 app,
@@ -701,10 +710,13 @@ fn start_sidecar(app: &tauri::AppHandle, runtime: &DesktopRuntime) {
         }
     };
     if let Ok(mut state) = runtime.child.lock() {
-        *state = Some(child);
+        let previous = state.replace(child);
+        drop(state);
+        if let Some(previous) = previous {
+            terminate_child_process_tree(previous);
+        }
     } else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child_process_tree(child);
         runtime.set_connection(Err(START_FAILED));
         record_diagnostic(
             app,

@@ -23,8 +23,13 @@ frontend/src-tauri/icons/*
 !frontend/src-tauri/icons/app-icon.svg
 !frontend/src-tauri/icons/icon.ico
 frontend/src-tauri/binaries/
+**/traces/
+*.trace.json
+*.trace.jsonl
 *.tsbuildinfo
 .debug-journal.md
 .workbuddy
 deliverables
 .claude
+.playwright-mcp
+.agents

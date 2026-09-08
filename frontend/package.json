@@ -1,16 +1,18 @@
 {
   "name": "codex-session-monitor-ui",
   "private": true,
-  "version": "6.3.9-dev.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\start-browser-dev.ps1",
     "dev:vite": "vite",
     "build": "tsc -b && vite build",
     "e2e": "node e2e/browser-smoke.mjs",
+    "e2e:layout": "node e2e/timeline-layout.mjs",
     "typecheck": "tsc -b --pretty false",
     "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\start-tauri-dev.ps1",
     "build:desktop": "vite build --config vite.desktop.config.ts",
+    "build:static": "vite build --config vite.config.ts",
     "dev:desktop": "vite --config vite.desktop.config.ts"
   },
   "dependencies": {

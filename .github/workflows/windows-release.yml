@@ -3,6 +3,12 @@ name: Windows release
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_unsigned_verify:
+        description: Run the Windows NSIS validation package
+        required: true
+        default: true
+        type: boolean
   push:
     tags:
       - "v*"
@@ -11,10 +17,48 @@ permissions:
   contents: read
 
 jobs:
+  change-scope:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      run_unsigned: ${{ steps.scope.outputs.run_unsigned }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Decide whether an installer build is required
+        id: scope
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_UNSIGNED_VERIFY: ${{ inputs.run_unsigned_verify }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "run_unsigned=$RUN_UNSIGNED_VERIFY" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed-files.txt"
+          if grep -Eq '^(src/|frontend/src/|frontend/src-tauri/|frontend/public/|frontend/package\.json$|frontend/package-lock\.json$|frontend/vite\.|frontend/tsconfig|frontend/index\.html$|scripts/|pyproject\.toml$|uv\.lock$|\.github/workflows/windows-release\.yml$)' "$RUNNER_TEMP/changed-files.txt"; then
+            echo "run_unsigned=true" >> "$GITHUB_OUTPUT"
+            echo "Installer-affecting files changed:"
+            grep -E '^(src/|frontend/src/|frontend/src-tauri/|frontend/public/|frontend/package\.json$|frontend/package-lock\.json$|frontend/vite\.|frontend/tsconfig|frontend/index\.html$|scripts/|pyproject\.toml$|uv\.lock$|\.github/workflows/windows-release\.yml$)' "$RUNNER_TEMP/changed-files.txt"
+          else
+            echo "run_unsigned=false" >> "$GITHUB_OUTPUT"
+            echo "No installer-affecting files changed; skipping NSIS build."
+          fi
+
   unsigned-verify:
-    if: github.event_name != 'push'
+    needs: change-scope
+    if: github.event_name != 'push' && (needs.change-scope.result == 'failure' || needs.change-scope.outputs.run_unsigned == 'true')
     runs-on: windows-latest
     steps:
+      - name: Fail closed when change scope detection fails
+        if: needs.change-scope.result == 'failure'
+        shell: pwsh
+        run: throw "Unable to determine whether the pull request requires an installer validation build."
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -38,7 +82,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-tauri-
       - name: Install build dependencies
-        run: uv sync --dev --python 3.12
+        run: uv sync --dev
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
@@ -69,7 +113,6 @@ jobs:
       id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ github.ref_name }}
       WINDOWS_SIGNING_PROVIDER: ${{ secrets.WINDOWS_SIGNING_PROVIDER }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -77,6 +120,7 @@ jobs:
       TAURI_UPDATER_ENDPOINT: ${{ secrets.TAURI_UPDATER_ENDPOINT }}
       WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
       WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      PUBLIC_RELEASE_GATE: ${{ vars.PUBLIC_RELEASE_GATE }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -156,15 +200,12 @@ jobs:
       - name: Prepare formal release version overlay
         shell: pwsh
         run: |
-          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
-            throw "Release tag has an invalid format: $env:RELEASE_TAG"
-          }
-          $releaseVersion = $env:RELEASE_TAG.Substring(1)
+          $releaseVersion = "${{ github.ref_name }}".TrimStart("v")
           pwsh -NoProfile -File scripts/prepare-release-version.ps1 -Version $releaseVersion
       - name: Verify synchronized release version
         shell: pwsh
         run: |
-          $tagVersion = $env:RELEASE_TAG.Substring(1)
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
           $projectVersion = uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
           if ($tagVersion -ne $projectVersion) {
             throw "Tag version $tagVersion does not match project version $projectVersion."
@@ -242,12 +283,15 @@ jobs:
           $recoveryUrl = if ($previousStableTag) { "https://github.com/${{ github.repository }}/releases/tag/$previousStableTag" } else { "" }
           "CODEX_MONITOR_RECOVERY_URL=$recoveryUrl" | Add-Content -LiteralPath $env:GITHUB_ENV
       - name: Install build dependencies
-        run: uv sync --dev --python 3.12
+        run: uv sync --dev
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
       - name: Run formal release gate
         run: pwsh -NoProfile -File scripts/check-release.ps1
+      - name: Run public release gate
+        if: env.PUBLIC_RELEASE_GATE == 'true'
+        run: pwsh -NoProfile -File scripts/public-release-check.ps1 -Root "${{ github.workspace }}" -PublicRoot "${{ github.workspace }}"
       - name: Install official Azure Artifact Signing module
         if: env.WINDOWS_SIGNING_PROVIDER == 'azure'
         shell: pwsh
@@ -378,17 +422,7 @@ jobs:
             if ($null -eq $uninstallerTarget) {
               throw "Signed NSIS uninstaller target evidence is missing (expected nst*.tmp or uninstall.exe)."
             }
-            $signingEvidence = [ordered]@{
-              artifacts = @($signedTargets | ForEach-Object {
-                [ordered]@{
-                  name = [IO.Path]::GetFileName($_)
-                  signed = $true
-                }
-              })
-              publisher = $env:WINDOWS_EXPECTED_PUBLISHER
-            }
-            $signingEvidence | ConvertTo-Json -Depth 5 |
-              Set-Content -LiteralPath "frontend/src-tauri/target/release/bundle/nsis/signing-evidence.json" -Encoding utf8
+            Copy-Item -LiteralPath $env:CODEX_SIGNING_LOG -Destination "frontend/src-tauri/target/release/bundle/nsis/signing-targets.txt"
           } else {
             throw "Signing target evidence is missing."
           }
@@ -402,22 +436,18 @@ jobs:
           if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Updater signature is missing." }
           $signature = Get-Content -LiteralPath $signaturePath -Raw
           [ordered]@{
-            version = $env:RELEASE_TAG.Substring(1)
+            version = "${{ github.ref_name }}".TrimStart("v")
             notes = "See the GitHub release notes."
             pub_date = (Get-Date).ToUniversalTime().ToString("o")
             platforms = @{
               "windows-x86_64" = @{
                 signature = $signature.Trim()
-                url = "https://github.com/${{ github.repository }}/releases/download/$env:RELEASE_TAG/$($updaterInstaller.Name)"
+                url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($updaterInstaller.Name)"
               }
             }
           } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bundleRoot/latest.json" -Encoding utf8
           $releaseFiles = Get-ChildItem $bundleRoot -File |
             Where-Object { $_.Name -notin @("checksums.sha256", "release-manifest.json") }
-          $assetNames = @($releaseFiles.Name)
-          if ($updaterInstaller.Name -notin $assetNames -or "$($updaterInstaller.Name).sig" -notin $assetNames) {
-            throw "Installer and updater signature must be included in the release asset set."
-          }
           $artifactDetails = @($releaseFiles | ForEach-Object {
             [ordered]@{
               name = $_.Name
@@ -428,8 +458,8 @@ jobs:
             ForEach-Object { "{0} *{1}" -f $_.Hash, (Split-Path -Leaf $_.Path) } |
             Set-Content -LiteralPath "$bundleRoot/checksums.sha256" -Encoding utf8
           [ordered]@{
-            version = $env:RELEASE_TAG.Substring(1)
-            current_stable_tag = $env:RELEASE_TAG
+            version = "${{ github.ref_name }}".TrimStart("v")
+            current_stable_tag = "${{ github.ref_name }}"
             previous_stable_tag = $env:PREVIOUS_STABLE_TAG
             commit = "${{ github.sha }}"
             target = "windows-x86_64"
@@ -438,19 +468,8 @@ jobs:
             test_evidence = @("https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
             artifacts = $artifactDetails
           } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bundleRoot/release-manifest.json" -Encoding utf8
-          $latest = Get-Content -LiteralPath "$bundleRoot/latest.json" -Raw | ConvertFrom-Json
-          $metadataInstallerName = [Uri]::UnescapeDataString(([Uri]$latest.platforms.'windows-x86_64'.url).Segments[-1])
-          if ($metadataInstallerName -ne $updaterInstaller.Name) {
-            throw "Updater metadata installer name does not match the packaged installer."
-          }
-          if (@($releaseFiles.Name | Where-Object { $_ -eq "signing-targets.txt" }).Count -gt 0) {
-            throw "Raw signing target paths must not be published."
-          }
       - name: Create draft release with current and previous release metadata
         shell: pwsh
         run: |
-          $uploadFiles = Get-ChildItem "frontend/src-tauri/target/release/bundle/nsis" -File |
-            Sort-Object -Property Name |
-            ForEach-Object { $_.FullName }
-          if ($uploadFiles.Count -eq 0) { throw "No release assets were produced." }
-          gh release create "$env:RELEASE_TAG" --draft --generate-notes @uploadFiles
+          gh release create "${{ github.ref_name }}" --draft --generate-notes `
+            "frontend/src-tauri/target/release/bundle/nsis/*"

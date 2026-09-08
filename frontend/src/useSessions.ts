@@ -184,6 +184,12 @@ export function useSessions() {
         if (event.event === "snapshot") {
           return new Map(event.data.map((session) => [session.session_key, session]));
         }
+        if (event.event === "trace_revision") {
+          window.dispatchEvent(new CustomEvent("codex-trace-revision", { detail: event }));
+          const next = new Map(current);
+          next.set(event.session_key, event.data);
+          return next;
+        }
         const next = new Map(current);
         next.set(event.session_key, event.data);
         return next;

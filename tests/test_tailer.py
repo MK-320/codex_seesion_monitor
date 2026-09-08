@@ -41,3 +41,15 @@ def test_tailer_skips_oversized_record(tmp_path: Path) -> None:
 
     assert batch.lines == (b'{"ok":true}',)
     assert batch.skipped_oversized == 1
+
+
+def test_tailer_keeps_large_records_without_an_explicit_limit(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    large = b"x" * (2 * 1024 * 1024)
+    _ = path.write_bytes(large + b"\n")
+
+    batch = read_complete_lines(path, 0)
+
+    assert batch.lines == (large,)
+    assert batch.offset == path.stat().st_size
+    assert batch.skipped_oversized == 0

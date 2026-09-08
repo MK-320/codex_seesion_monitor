@@ -171,7 +171,7 @@ def test_frontend_declares_continuous_long_session_layout() -> None:
     assert "follow-indicator" in built_styles
     assert "follow-new-count" in built_styles
     assert "MAX_DETAIL_TURNS" in hook
-    assert "content-visibility: auto" in styles
+    assert "content-visibility: auto" not in styles
     assert "@media" not in styles
     assert "@media" not in built_styles
 

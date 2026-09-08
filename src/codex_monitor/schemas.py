@@ -1,7 +1,8 @@
 import hashlib
 import json
 import time
-from typing import ClassVar, Literal
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from typing import ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,15 +13,39 @@ from codex_monitor.models import (
     SessionStatus,
     ToolCall,
     ToolStatus,
+    TraceEvent,
     Turn,
 )
 from codex_monitor.parser import summarize
 
 QUIET_AFTER_SECONDS = 120
+EVENT_MESSAGE_KINDS = frozenset(
+    {"task_started", "user_message", "agent_message", "task_complete", "turn_aborted"}
+)
+DISCOVERY_EVENT_KINDS = frozenset(
+    {
+        "tool_search",
+        "tool_search_result",
+        "web_search",
+        "web_search_result",
+        "available_tools",
+        "tool_list",
+    }
+)
 
 
 class ApiModel(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+
+
+class _CursorError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("cursor is invalid or expired")
+
+
+class _CursorConflictError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("cursor cannot be combined with before")
 
 
 class ToolCallView(ApiModel):
@@ -92,6 +117,391 @@ class SessionDetail(SessionSummary):
     turns: tuple[TurnView, ...]
     has_earlier: bool
     next_before: int | None
+
+
+class TraceEventView(ApiModel):
+    trace_id: str
+    provider: str
+    session_id: str
+    turn_id: str | None
+    sequence: int
+    event_kind: str
+    call_id: str | None
+    related_trace_id: str | None = None
+    tool_name: str | None
+    namespace: str | None
+    status: str
+    started_at: float | None
+    ended_at: float | None
+    duration_ms: int | None
+    input_value: object | None = None
+    result_value: object | None = None
+    raw_payload: object | None = None
+    input_preview: str | None = None
+    result_preview: str | None = None
+    raw_preview: str | None = None
+    content_available: bool = False
+    source_line: int | None
+    source_offset: int | None
+    source_type: str | None
+    parse_state: str
+    content_metadata: dict[str, object]
+    parallel_batch: int | None = None
+
+
+class TracePage(ApiModel):
+    events: tuple[TraceEventView, ...]
+    total: int
+    has_earlier: bool
+    next_before: int | None
+    metadata_only: bool
+    query: str | None
+    next_cursor: str | None = None
+    index_state: Literal["ready", "building", "unavailable"] = "ready"
+    data_freshness: Literal["live", "historical", "unavailable"] = "live"
+
+
+class TraceSearchRequest(ApiModel):
+    provider: str = "codex"
+    session_key: str | None = None
+    query: str | None = Field(default=None, max_length=512)
+    metadata_only: bool = False
+    turn_id: str | None = Field(default=None, max_length=256)
+    event_kind: str | None = Field(default=None, max_length=64)
+    status: str | None = Field(default=None, max_length=32)
+    tool_name: str | None = Field(default=None, max_length=256)
+    from_time: float | None = Field(default=None, ge=0)
+    to_time: float | None = Field(default=None, ge=0)
+    limit: int = Field(default=100, ge=1, le=500)
+    cursor: str | None = Field(default=None, max_length=1024)
+
+
+class TraceSearchResult(ApiModel):
+    session_key: str
+    event: TraceEventView
+
+
+class TraceSearchPage(ApiModel):
+    results: tuple[TraceSearchResult, ...]
+    total: int
+    next_cursor: str | None = None
+    metadata_only: bool
+    query: str | None
+    index_state: Literal["ready", "building", "unavailable"] = "ready"
+
+
+def trace_page(  # noqa: PLR0913
+    session: Session,
+    limit: int = 100,
+    before: int | None = None,
+    query: str | None = None,
+    metadata_only: bool = False,
+    event_kind: str | None = None,
+    status: str | None = None,
+    tool_name: str | None = None,
+    from_time: float | None = None,
+    to_time: float | None = None,
+    turn_id: str | None = None,
+    cursor: str | None = None,
+) -> TracePage:
+    return trace_page_events(
+        session.trace_events,
+        limit,
+        before,
+        query,
+        metadata_only,
+        event_kind,
+        status,
+        tool_name,
+        from_time,
+        to_time,
+        turn_id,
+        cursor,
+    )
+
+
+def trace_page_events(  # noqa: C901, PLR0912, PLR0913
+    events: list[TraceEvent],
+    limit: int = 100,
+    before: int | None = None,
+    query: str | None = None,
+    metadata_only: bool = False,
+    event_kind: str | None = None,
+    status: str | None = None,
+    tool_name: str | None = None,
+    from_time: float | None = None,
+    to_time: float | None = None,
+    turn_id: str | None = None,
+    cursor: str | None = None,
+) -> TracePage:
+    normalized_query = query.casefold().strip() if query else None
+    matching: list[TraceEvent] = []
+    for event in events:
+        if normalized_query is not None and not _trace_matches(
+            event, normalized_query, metadata_only
+        ):
+            continue
+        if event_kind is not None:
+            if event_kind == "event_msg":
+                if event.event_kind not in EVENT_MESSAGE_KINDS:
+                    continue
+            elif event_kind == "discovery":
+                if event.event_kind not in DISCOVERY_EVENT_KINDS:
+                    continue
+            elif event.event_kind != event_kind:
+                continue
+        if status is not None and event.status.value != status:
+            continue
+        if tool_name is not None and event.tool_name != tool_name:
+            continue
+        if turn_id is not None and (event.turn_id is None or str(event.turn_id) != turn_id):
+            continue
+        if from_time is not None and (event.ended_at or event.started_at or 0) < from_time:
+            continue
+        if to_time is not None and (event.started_at or event.ended_at or 0) > to_time:
+            continue
+        matching.append(event)
+    if before is not None and cursor is not None:
+        raise _CursorConflictError
+    if cursor is not None:
+        boundary = _decode_trace_cursor(
+            cursor,
+            events,
+            query,
+            metadata_only,
+            event_kind,
+            status,
+            tool_name,
+            from_time,
+            to_time,
+            turn_id,
+        )
+        end = sum(1 for event in matching if event.sequence < boundary)
+    else:
+        end = len(matching) if before is None else max(0, min(before, len(matching)))
+    start = max(0, end - limit)
+    selected = matching[start:end]
+    parallel_batches = _parallel_batches(events)
+    return TracePage(
+        events=tuple(
+            _trace_view(event, parallel_batches.get(event.trace_id)) for event in selected
+        ),
+        total=len(matching),
+        has_earlier=start > 0,
+        next_before=start if start > 0 else None,
+        metadata_only=metadata_only,
+        query=query,
+        next_cursor=(
+            None
+            if start == 0
+            else _encode_trace_cursor(
+                matching[start].sequence,
+                events,
+                query,
+                metadata_only,
+                event_kind,
+                status,
+                tool_name,
+                from_time,
+                to_time,
+                turn_id,
+            )
+        ),
+    )
+
+
+def _trace_cursor_context(  # noqa: PLR0913
+    events: list[TraceEvent],
+    query: str | None,
+    metadata_only: bool,
+    event_kind: str | None,
+    status: str | None,
+    tool_name: str | None,
+    from_time: float | None,
+    to_time: float | None,
+    turn_id: str | None,
+) -> dict[str, object]:
+    fingerprint = hashlib.sha256(
+        "|".join(f"{event.sequence}:{event.trace_id}" for event in events).encode("utf-8")
+    ).hexdigest()
+    return {
+        "v": 1,
+        "fingerprint": fingerprint,
+        "query": query,
+        "metadata_only": metadata_only,
+        "event_kind": event_kind,
+        "status": status,
+        "tool_name": tool_name,
+        "from_time": from_time,
+        "to_time": to_time,
+        "turn_id": turn_id,
+    }
+
+
+def _encode_trace_cursor(  # noqa: PLR0913
+    sequence: int,
+    events: list[TraceEvent],
+    query: str | None,
+    metadata_only: bool,
+    event_kind: str | None,
+    status: str | None,
+    tool_name: str | None,
+    from_time: float | None,
+    to_time: float | None,
+    turn_id: str | None,
+) -> str:
+    payload = _trace_cursor_context(
+        events,
+        query,
+        metadata_only,
+        event_kind,
+        status,
+        tool_name,
+        from_time,
+        to_time,
+        turn_id,
+    )
+    payload["sequence"] = sequence
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+def _decode_trace_cursor(  # noqa: PLR0913
+    cursor: str,
+    events: list[TraceEvent],
+    query: str | None,
+    metadata_only: bool,
+    event_kind: str | None,
+    status: str | None,
+    tool_name: str | None,
+    from_time: float | None,
+    to_time: float | None,
+    turn_id: str | None,
+) -> int:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded_value = cast("object", json.loads(urlsafe_b64decode(padded).decode("utf-8")))
+        if not isinstance(decoded_value, dict):
+            raise _CursorError
+        decoded = cast("dict[str, object]", decoded_value)
+        sequence = decoded.get("sequence")
+        if not isinstance(sequence, int):
+            raise _CursorError
+        expected = _trace_cursor_context(
+            events,
+            query,
+            metadata_only,
+            event_kind,
+            status,
+            tool_name,
+            from_time,
+            to_time,
+            turn_id,
+        )
+        if any(decoded.get(key) != value for key, value in expected.items()):
+            raise _CursorError
+        return sequence  # noqa: TRY300
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise _CursorError from None
+
+
+def _parallel_batches(events: list[TraceEvent]) -> dict[str, int]:
+    now = time.time()
+    timed = sorted(
+        (
+            event
+            for event in events
+            if event.started_at is not None
+            and event.call_id is not None
+            and event.event_kind in {"function_call", "custom_tool_call", "tool_call", "shell"}
+        ),
+        key=lambda event: (event.started_at or 0, event.sequence),
+    )
+    batches: dict[str, int] = {}
+    batch_number = 0
+    component: list[TraceEvent] = []
+    component_end = 0.0
+    for event in timed:
+        start = event.started_at or 0.0
+        end = event.ended_at if event.ended_at is not None else now
+        if component and start >= component_end:
+            if len(component) > 1:
+                batch_number += 1
+                for member in component:
+                    batches[member.trace_id] = batch_number
+            component = []
+            component_end = 0.0
+        component.append(event)
+        component_end = max(component_end, end)
+    if len(component) > 1:
+        batch_number += 1
+        for member in component:
+            batches[member.trace_id] = batch_number
+    return batches
+
+
+def _trace_matches(event: TraceEvent, query: str, metadata_only: bool) -> bool:
+    values: list[object] = [
+        event.sequence,
+        event.event_kind,
+        event.call_id,
+        event.tool_name,
+        event.namespace,
+        event.status.value,
+        event.source_type,
+        event.parse_state.value,
+    ]
+    if not metadata_only:
+        values.extend((event.input_value, event.result_value, event.raw_payload))
+    return query in " ".join(_trace_text(value) for value in values).casefold()
+
+
+def _trace_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _trace_view(event: TraceEvent, parallel_batch: int | None = None) -> TraceEventView:
+    return TraceEventView(
+        trace_id=event.trace_id,
+        provider=event.provider,
+        session_id=event.session_id,
+        turn_id=None if event.turn_id is None else str(event.turn_id),
+        sequence=event.sequence,
+        event_kind=event.event_kind,
+        call_id=event.call_id,
+        related_trace_id=event.related_trace_id,
+        tool_name=event.tool_name,
+        namespace=event.namespace,
+        status=event.status.value,
+        started_at=event.started_at,
+        ended_at=event.ended_at,
+        duration_ms=event.duration_ms,
+        input_preview=_trace_preview(event.input_value),
+        result_preview=_trace_preview(event.result_value),
+        raw_preview=_trace_preview(event.raw_payload),
+        content_available=any(
+            value is not None
+            for value in (event.input_value, event.result_value, event.raw_payload)
+        ),
+        source_line=event.source_line,
+        source_offset=event.source_offset,
+        source_type=event.source_type,
+        parse_state=event.parse_state.value,
+        content_metadata=event.content_metadata,
+        parallel_batch=parallel_batch,
+    )
+
+
+def _trace_preview(value: object | None, limit: int = 240) -> str | None:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else _trace_text(value)
+    return text if len(text) <= limit else f"{text[:limit]}…"
 
 
 def session_summary(
@@ -460,4 +870,17 @@ class SessionChangedEvent(ApiModel):
     data: SessionSummary
 
 
-type RealtimeEvent = SnapshotEvent | SessionChangedEvent
+class TraceRevisionEvent(ApiModel):
+    event: Literal["trace_revision"] = "trace_revision"
+    version: int
+    protocol_version: Literal[1] = 1
+    generated_at: float = Field(default_factory=time.time)
+    session_key: str
+    data: SessionSummary
+    provider: str = "codex"
+    added_trace_ids: tuple[str, ...] = ()
+    updated_trace_ids: tuple[str, ...] = ()
+    last_sequence: int | None = None
+
+
+type RealtimeEvent = SnapshotEvent | SessionChangedEvent | TraceRevisionEvent

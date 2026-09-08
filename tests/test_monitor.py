@@ -352,6 +352,60 @@ async def test_monitor_import_during_initial_load_keeps_historical_sessions(
 
 
 @pytest.mark.anyio
+async def test_monitor_initial_load_populates_store_before_sync_signal(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session_path = session_root / "initial.jsonl"
+    _ = session_path.write_text(_session_meta(project) + TASK_STARTED, encoding="utf-8")
+    store = SessionStore()
+    monitor = Monitor(AppConfig(project_root=project, session_root=session_root), store)
+
+    await monitor._initial_load()  # pyright: ignore[reportPrivateUsage]
+    await monitor.wait_initial_sync()
+
+    session = store.get_by_path(session_path)
+    assert session is not None
+    assert session.byte_offset == session_path.stat().st_size
+    assert monitor.runtime_health().known_file_count == 1
+    assert monitor.data_is_fresh(1783134002)
+
+
+@pytest.mark.anyio
+async def test_monitor_reloads_same_size_replaced_log(tmp_path: Path) -> None:
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    session_path = session_root / "replaced.jsonl"
+    project = tmp_path / "project"
+    project.mkdir()
+    original = _session_meta(project) + TASK_STARTED
+    replacement = original.replace('"turn-live"', '"turn-dead"')
+    assert len(original) == len(replacement)
+    _ = session_path.write_text(original, encoding="utf-8")
+
+    store = SessionStore()
+    monitor = Monitor(AppConfig(project_root=project, session_root=session_root), store)
+    assert await monitor.process_path(session_path) is ChangeKind.CREATED
+    initial = store.get_by_path(session_path)
+    assert initial is not None
+    initial_turn = initial.current_turn
+    assert initial_turn is not None
+    assert str(initial_turn.turn_id) == "turn-live"
+
+    temporary = session_path.with_suffix(".replacement")
+    _ = temporary.write_text(replacement, encoding="utf-8")
+    _ = temporary.replace(session_path)
+
+    assert await monitor.process_path(session_path) is ChangeKind.UPDATED
+    replaced = store.get_by_path(session_path)
+    assert replaced is not None
+    replaced_turn = replaced.current_turn
+    assert replaced_turn is not None
+    assert str(replaced_turn.turn_id) == "turn-dead"
+
+
+@pytest.mark.anyio
 async def test_monitor_import_is_idempotent_and_rejects_missing_directory(tmp_path: Path) -> None:
     session_root = tmp_path / "sessions"
     session_root.mkdir()

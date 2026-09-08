@@ -1071,7 +1071,7 @@ mod tests {
             "component": "api",
             "event_code": "request_failed",
             "operation_id": "op-7",
-            "path_alias": "C:\\fixtures\\secret"
+            "path_alias": "C:\\Users\\DK\\secret"
         });
         log.ingest_sidecar_line(line.to_string().as_bytes());
 

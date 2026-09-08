@@ -35,7 +35,7 @@ def _sensitive_store(tmp_path: Path) -> SessionStore:
                         "type": "event_msg",
                         "payload": {
                             "type": "user_message",
-                            "message": "example-api-token https://alice:password@example.test/private",
+                            "message": "sk-secret-token https://alice:password@example.test/private",
                         },
                     }
                 ),
@@ -79,7 +79,7 @@ def test_diagnostics_only_contains_aggregated_non_sensitive_data(tmp_path: Path)
     assert health["coalesced_event_count"] == 99
     assert "private-session-id" not in serialized
     assert str(tmp_path) not in serialized
-    assert "example-api-token" not in serialized
+    assert "sk-secret-token" not in serialized
     assert "alice:password" not in serialized
 
 
@@ -101,5 +101,5 @@ def test_diagnostics_api_previews_without_writing_files(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*diagnostic*"))
     serialized = response.text
     assert "private-session-id" not in serialized
-    assert "example-api-token" not in serialized
+    assert "sk-secret-token" not in serialized
     assert str(tmp_path) not in serialized

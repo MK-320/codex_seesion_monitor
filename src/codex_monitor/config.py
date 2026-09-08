@@ -8,6 +8,9 @@ from typing import Annotated, ClassVar, Final, Literal, cast
 from pydantic import BaseModel, ConfigDict, DirectoryPath, Field, SecretStr
 
 DEFAULT_SESSION_ROOT: Final = Path.home() / ".codex" / "sessions"
+DEFAULT_TRACE_ROOT: Final = (
+    Path(os.environ.get("LOCALAPPDATA", Path.home() / ".config")) / "CodexSessionMonitor" / "traces"
+)
 DEFAULT_CONFIG_FILE: Final = (
     Path(os.environ.get("LOCALAPPDATA", Path.home() / ".config"))
     / "CodexSessionMonitor"
@@ -39,6 +42,9 @@ class AppConfig(BaseModel):
     project_root: DirectoryPath | None = None
     project_roots: tuple[DirectoryPath, ...] = ()
     session_root: DirectoryPath = DEFAULT_SESSION_ROOT
+    trace_root: Path = DEFAULT_TRACE_ROOT
+    trace_enabled: bool = True
+    trace_retention_days: Annotated[int | None, Field(gt=0)] = None
     stuck_seconds: Annotated[int | None, Field(gt=0)] = 300
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: Annotated[int, Field(ge=0, le=65535)] = 8000
@@ -130,5 +136,34 @@ def save_saved_activity_alert_seconds(path: Path, seconds: int | None) -> None:
     with _CONFIG_WRITE_LOCK:
         data = _load_saved_config(path)
         data.update({"version": 1, "activity_alert_seconds": seconds})
+        _ = data.setdefault("projects", [])
+        _write_saved_config(path, data)
+
+
+def load_saved_trace_settings(
+    path: Path,
+    default_enabled: bool,
+    default_retention_days: int | None,
+) -> tuple[bool, int | None]:
+    data = _load_saved_config(path)
+    enabled = data.get("trace_enabled", default_enabled)
+    retention = data.get("trace_retention_days", default_retention_days)
+    if not isinstance(enabled, bool):
+        enabled = default_enabled
+    if retention is not None and (not isinstance(retention, int) or retention <= 0):
+        retention = default_retention_days
+    return enabled, retention if retention is None else int(retention)
+
+
+def save_saved_trace_settings(path: Path, enabled: bool, retention_days: int | None) -> None:
+    with _CONFIG_WRITE_LOCK:
+        data = _load_saved_config(path)
+        data.update(
+            {
+                "version": 1,
+                "trace_enabled": enabled,
+                "trace_retention_days": retention_days,
+            }
+        )
         _ = data.setdefault("projects", [])
         _write_saved_config(path, data)
