@@ -195,18 +195,7 @@ jobs:
               $securePassword,
               [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
             )
-            foreach ($storeName in @("Root", "TrustedPublisher")) {
-              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-                $storeName,
-                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-              )
-              try {
-                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-                $store.Add($certificate)
-              } finally {
-                $store.Close()
-              }
-            }
+            "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" | Add-Content -LiteralPath $env:GITHUB_ENV
           }
       - name: Verify tag source
         shell: pwsh
@@ -260,12 +249,32 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Previous stable assets could not be downloaded." }
             $previousInstaller = Get-ChildItem $previousRoot -Filter "*setup.exe" -File | Select-Object -First 1
             $previousSignature = Get-AuthenticodeSignature -FilePath $previousInstaller.FullName
-            if ($previousSignature.Status -ne "Valid" -or
+            if ($null -eq $previousSignature.SignerCertificate -or
                 $previousSignature.SignerCertificate.Subject -ne $env:WINDOWS_EXPECTED_PUBLISHER -or
                 $null -eq $previousSignature.TimeStamperCertificate) {
               $signerSubject = if ($previousSignature.SignerCertificate) { $previousSignature.SignerCertificate.Subject } else { "<none>" }
               $timestampSubject = if ($previousSignature.TimeStamperCertificate) { $previousSignature.TimeStamperCertificate.Subject } else { "<none>" }
               throw "Previous stable installer trust verification failed: status=$($previousSignature.Status); signer=$signerSubject; timestamp=$timestampSubject."
+            }
+            if ($env:WINDOWS_SIGNING_PROVIDER -eq "selfsigned") {
+              if ($previousSignature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT -or
+                  $previousSignature.Status -ne "UnknownError") {
+                throw "Previous stable self-signed installer certificate verification failed."
+              }
+              $securePassword = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+              $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                $env:WINDOWS_CERTIFICATE_PATH,
+                $securePassword,
+                [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+              )
+              $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+              $chain.ChainPolicy.TrustMode = [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+              $chain.ChainPolicy.CustomTrustStore.Add($expectedCertificate)
+              if (-not $chain.Build($previousSignature.SignerCertificate)) {
+                throw "Previous stable self-signed installer certificate chain verification failed."
+              }
+            } elseif ($previousSignature.Status -ne "Valid") {
+              throw "Previous stable installer trust verification failed: status=$($previousSignature.Status)."
             }
             $checksumEntries = @{}
             foreach ($line in Get-Content -LiteralPath "$previousRoot/checksums.sha256") {
