@@ -188,6 +188,21 @@ jobs:
           $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.pfx"
           [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
           "WINDOWS_CERTIFICATE_PATH=$certificatePath" | Add-Content -LiteralPath $env:GITHUB_ENV
+          if ($env:WINDOWS_SIGNING_PROVIDER -eq "selfsigned") {
+            $securePassword = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $certificatePath,
+              $securePassword,
+              [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            )
+            $trustedCertificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.cer"
+            [IO.File]::WriteAllBytes(
+              $trustedCertificatePath,
+              $certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+            )
+            Import-Certificate -FilePath $trustedCertificatePath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher |
+              Out-Null
+          }
       - name: Verify tag source
         shell: pwsh
         run: |
