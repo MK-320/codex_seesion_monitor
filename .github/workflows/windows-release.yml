@@ -195,15 +195,18 @@ jobs:
               $securePassword,
               [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
             )
-            $trustedCertificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.cer"
-            [IO.File]::WriteAllBytes(
-              $trustedCertificatePath,
-              $certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-            )
-            & certutil.exe -f -user -addstore Root $trustedCertificatePath | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Unable to trust self-signed root certificate." }
-            & certutil.exe -f -user -addstore TrustedPublisher $trustedCertificatePath | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Unable to trust self-signed publisher certificate." }
+            foreach ($storeName in @("Root", "TrustedPublisher")) {
+              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+                $storeName,
+                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+              )
+              try {
+                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $store.Add($certificate)
+              } finally {
+                $store.Close()
+              }
+            }
           }
       - name: Verify tag source
         shell: pwsh
