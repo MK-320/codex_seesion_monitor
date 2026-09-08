@@ -311,8 +311,13 @@ jobs:
             }
             $metadataInstallerName = [Uri]::UnescapeDataString(([Uri]$windowsPlatform.Value.url).Segments[-1])
             $expectedUpdaterSignature = (Get-Content -LiteralPath $previousSignaturePath -Raw).Trim()
+            $installerHash = (Get-FileHash -LiteralPath $previousInstaller.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+            $metadataNameMatches = $metadataInstallerName -eq $previousInstaller.Name
+            if (-not $metadataNameMatches -and $checksumEntries.ContainsKey($metadataInstallerName)) {
+              $metadataNameMatches = $checksumEntries[$metadataInstallerName] -eq $installerHash
+            }
             if ($previousLatest.version -ne $previousStableTag.TrimStart("v") -or
-                $metadataInstallerName -ne $previousInstaller.Name -or
+                -not $metadataNameMatches -or
                 $windowsPlatform.Value.signature.Trim() -ne $expectedUpdaterSignature) {
               throw "Previous stable updater metadata verification failed."
             }
