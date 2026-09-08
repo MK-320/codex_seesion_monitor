@@ -200,6 +200,8 @@ jobs:
               $trustedCertificatePath,
               $certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
             )
+            Import-Certificate -FilePath $trustedCertificatePath -CertStoreLocation Cert:\CurrentUser\Root |
+              Out-Null
             Import-Certificate -FilePath $trustedCertificatePath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher |
               Out-Null
           }
@@ -258,7 +260,9 @@ jobs:
             if ($previousSignature.Status -ne "Valid" -or
                 $previousSignature.SignerCertificate.Subject -ne $env:WINDOWS_EXPECTED_PUBLISHER -or
                 $null -eq $previousSignature.TimeStamperCertificate) {
-              throw "Previous stable installer trust verification failed."
+              $signerSubject = if ($previousSignature.SignerCertificate) { $previousSignature.SignerCertificate.Subject } else { "<none>" }
+              $timestampSubject = if ($previousSignature.TimeStamperCertificate) { $previousSignature.TimeStamperCertificate.Subject } else { "<none>" }
+              throw "Previous stable installer trust verification failed: status=$($previousSignature.Status); signer=$signerSubject; timestamp=$timestampSubject."
             }
             $checksumEntries = @{}
             foreach ($line in Get-Content -LiteralPath "$previousRoot/checksums.sha256") {
